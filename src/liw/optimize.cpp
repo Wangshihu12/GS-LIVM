@@ -417,23 +417,63 @@ std::vector<Eigen::Vector3d, Eigen::aligned_allocator<Eigen::Vector3d>> lioOptim
   return closest_neighbors;
 }
 
+/**
+ * ICP优化函数
+ * 使用迭代扩展卡尔曼滤波器（IEKF）对当前帧进行位姿优化
+ * @param p_frame 当前点云帧指针
+ * @param cur_icp_options 当前ICP优化选项配置
+ * @param sample_voxel_size 采样体素大小
+ * @return 优化结果摘要
+ */
 optimizeSummary lioOptimization::optimize(cloudFrame* p_frame, const icpOptions& cur_icp_options, double sample_voxel_size) {
+  // === 创建关键点向量 ===
   std::vector<point3D> keypoints;
+  
+  // === 对点云进行网格下采样 ===
+  // 从完整的点云帧中提取关键点，减少计算量并保持空间分布特性
+  // 参数说明：
+  // - p_frame->point_frame: 输入的完整点云
+  // - keypoints: 输出的关键点集合
+  // - sample_voxel_size: 采样体素的大小，决定采样密度
   gridSampling(p_frame->point_frame, keypoints, sample_voxel_size);
 
+  // === 初始化优化结果摘要 ===
   optimizeSummary optimize_summary;
 
+  // === 执行IEKF位姿优化 ===
+  // 使用迭代扩展卡尔曼滤波器进行点云配准和位姿估计
+  // 参数说明：
+  // - cur_icp_options: ICP优化的配置参数（迭代次数、收敛阈值等）
+  // - voxel_map: 全局体素地图，作为配准的参考
+  // - keypoints: 当前帧的关键点集合
+  // - p_frame: 当前帧（包含状态信息，会在优化过程中更新）
   optimize_summary = updateIEKF(cur_icp_options, voxel_map, keypoints, p_frame);
 
+  // === 检查优化是否成功 ===
   if (!optimize_summary.success) {
+    // 如果优化失败，直接返回失败结果
     return optimize_summary;
   }
 
-  Eigen::Quaterniond q_end = p_frame->p_state->rotation;
-  Eigen::Vector3d t_end = p_frame->p_state->translation;
+  // === 获取优化后的最终位姿 ===
+  Eigen::Quaterniond q_end = p_frame->p_state->rotation;     // 最终旋转（四元数）
+  Eigen::Vector3d t_end = p_frame->p_state->translation;     // 最终平移（向量）
+  
+  // === 将优化后的位姿应用到点云帧的所有点 ===
+  // 遍历当前帧的所有点，使用优化后的位姿进行坐标变换
   for (auto& point_temp : p_frame->point_frame) {
+    // 对每个点进行坐标变换：
+    // 1. 从激光雷达坐标系变换到IMU坐标系
+    // 2. 应用优化后的旋转和平移
+    // 参数说明：
+    // - point_temp: 待变换的点
+    // - q_end: 优化后的旋转
+    // - t_end: 优化后的平移  
+    // - R_imu_lidar: IMU到激光雷达的旋转矩阵
+    // - t_imu_lidar: IMU到激光雷达的平移向量
     transformPoint(point_temp, q_end, t_end, R_imu_lidar, t_imu_lidar);
   }
 
+  // === 返回优化结果 ===
   return optimize_summary;
 }

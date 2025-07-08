@@ -596,122 +596,209 @@ void lioOptimization::addPointToMap(
   }
 }
 
+/**
+ * 将RGB点添加到颜色体素地图中
+ * @param map 颜色体素哈希地图引用
+ * @param point RGB点数据
+ * @param voxel_size 体素大小
+ * @param max_num_points_in_voxel 每个体素允许的最大点数
+ * @param min_distance_points 点之间的最小距离阈值
+ * @param min_num_points 体素中要求的最小点数
+ * @param p_frame 当前点云帧指针
+ * @param voxels_recent_visited_temp 最近访问体素的临时列表
+ */
 void lioOptimization::addPointToColorMap(
-    voxelHashMap& map,
-    rgbPoint& point,
-    double voxel_size,
-    int max_num_points_in_voxel,
-    double min_distance_points,
-    int min_num_points,
-    cloudFrame* p_frame,
-    std::vector<voxelId>& voxels_recent_visited_temp) {
-  bool add_point = true;
+  voxelHashMap& map,
+  rgbPoint& point,
+  double voxel_size,
+  int max_num_points_in_voxel,
+  double min_distance_points,
+  int min_num_points,
+  cloudFrame* p_frame,
+  std::vector<voxelId>& voxels_recent_visited_temp) {
 
-  int point_map_kx = static_cast<short>(point.getPosition().x() / min_distance_points);
-  int point_map_ky = static_cast<short>(point.getPosition().y() / min_distance_points);
-  int point_map_kz = static_cast<short>(point.getPosition().z() / min_distance_points);
+// 默认允许添加点
+bool add_point = true;
 
-  int kx = static_cast<short>(point.getPosition().x() / voxel_size);
-  int ky = static_cast<short>(point.getPosition().y() / voxel_size);
-  int kz = static_cast<short>(point.getPosition().z() / voxel_size);
+// === 计算点在距离网格中的索引 ===
+// 用于检查是否已有相近的点存在，避免重复添加
+int point_map_kx = static_cast<short>(point.getPosition().x() / min_distance_points);
+int point_map_ky = static_cast<short>(point.getPosition().y() / min_distance_points);
+int point_map_kz = static_cast<short>(point.getPosition().z() / min_distance_points);
 
-  if (hashmap_3d_points.if_exist(point_map_kx, point_map_ky, point_map_kz)) {
-    add_point = false;
+// === 计算点在体素网格中的索引 ===
+// 用于确定点应该添加到哪个体素中
+int kx = static_cast<short>(point.getPosition().x() / voxel_size);
+int ky = static_cast<short>(point.getPosition().y() / voxel_size);
+int kz = static_cast<short>(point.getPosition().z() / voxel_size);
+
+// === 检查是否已存在相近的点 ===
+// 如果在最小距离范围内已有点存在，则不添加此点（避免冗余）
+if (hashmap_3d_points.if_exist(point_map_kx, point_map_ky, point_map_kz)) {
+  add_point = false;
+}
+
+// === 查找目标体素是否已存在 ===
+voxelHashMap::iterator search = map.find(voxel(kx, ky, kz));
+
+if (search != map.end()) {
+  // === 体素已存在的情况 ===
+  auto& voxel_block = (search.value());  // 获取体素块引用
+
+  // 检查体素是否还有空间容纳更多点
+  if (!voxel_block.IsFull()) {
+    // 检查体素中的点数是否满足最小要求
+    if (min_num_points <= 0 || voxel_block.NumPoints() >= min_num_points) {
+      // 将点添加到体素块中
+      voxel_block.AddPoint(point);
+
+      // === 如果允许添加点，则更新全局RGB点列表 ===
+      if (add_point) {
+        // 使用互斥锁保护共享资源，确保线程安全
+        std::lock_guard<std::mutex> lock(*img_pro->map_tracker->mutex_rgb_points_vec);
+        
+        // 设置点的索引为当前RGB点向量的大小
+        point.point_index = img_pro->map_tracker->rgb_points_vec.size();
+        
+        // 将新添加的点的指针添加到RGB点向量中
+        img_pro->map_tracker->rgb_points_vec.push_back(&voxel_block.points.back());
+        
+        // 在3D点哈希表中插入此点的记录
+        hashmap_3d_points.insert(
+            point_map_kx, point_map_ky, point_map_kz, 
+            img_pro->map_tracker->rgb_points_vec.back());
+      }
+    }
   }
 
-  voxelHashMap::iterator search = map.find(voxel(kx, ky, kz));
+  // === 更新体素的访问时间 ===
+  // 检查当前帧时间与上次处理时间、体素上次访问时间是否不同
+  if (fabs(p_frame->time_sweep_end - img_pro->time_last_process) > 1e-5 &&
+      fabs(voxel_block.last_visited_time - p_frame->time_sweep_end) > 1e-5) {
+    // 更新体素的最后访问时间
+    voxel_block.last_visited_time = p_frame->time_sweep_end;
+    // 将此体素添加到最近访问的体素列表中
+    voxels_recent_visited_temp.push_back(voxelId(kx, ky, kz));
+  }
+} else {
+  // === 体素不存在的情况，需要创建新体素 ===
+  if (min_num_points <= 0) {  // 如果没有最小点数限制
+    // 创建新的体素块
+    voxelBlock voxel_block(max_num_points_in_voxel);
+    voxel_block.AddPoint(point);  // 添加点到新体素块
+    
+    // 将新体素块移动到地图中
+    map[voxel(kx, ky, kz)] = std::move(voxel_block);
 
-  if (search != map.end()) {
-    auto& voxel_block = (search.value());
-
-    if (!voxel_block.IsFull()) {
-      if (min_num_points <= 0 || voxel_block.NumPoints() >= min_num_points) {
-        voxel_block.AddPoint(point);
-
-        if (add_point) {
-          std::lock_guard<std::mutex> lock(*img_pro->map_tracker->mutex_rgb_points_vec);
-          point.point_index = img_pro->map_tracker->rgb_points_vec.size();
-          img_pro->map_tracker->rgb_points_vec.push_back(&voxel_block.points.back());
-          hashmap_3d_points.insert(
-              point_map_kx, point_map_ky, point_map_kz, img_pro->map_tracker->rgb_points_vec.back());
-        }
-      }
+    // === 如果允许添加点，则更新全局RGB点列表 ===
+    if (add_point) {
+      // 使用互斥锁保护共享资源
+      std::lock_guard<std::mutex> lock(*img_pro->map_tracker->mutex_rgb_points_vec);
+      
+      // 设置点索引
+      point.point_index = img_pro->map_tracker->rgb_points_vec.size();
+      
+      // 将新点的指针添加到RGB点向量中
+      img_pro->map_tracker->rgb_points_vec.push_back(&map[voxel(kx, ky, kz)].points.back());
+      
+      // 在3D点哈希表中插入记录
+      hashmap_3d_points.insert(
+          point_map_kx, point_map_ky, point_map_kz, 
+          img_pro->map_tracker->rgb_points_vec.back());
     }
 
+    // === 更新新体素的访问时间 ===
     if (fabs(p_frame->time_sweep_end - img_pro->time_last_process) > 1e-5 &&
-        fabs(voxel_block.last_visited_time - p_frame->time_sweep_end) > 1e-5) {
-      voxel_block.last_visited_time = p_frame->time_sweep_end;
+        fabs(map[voxel(kx, ky, kz)].last_visited_time - p_frame->time_sweep_end) > 1e-5) {
+      // 设置新体素的最后访问时间
+      map[voxel(kx, ky, kz)].last_visited_time = p_frame->time_sweep_end;
+      // 将新体素添加到最近访问列表中
       voxels_recent_visited_temp.push_back(voxelId(kx, ky, kz));
-    }
-  } else {
-    if (min_num_points <= 0) {
-      voxelBlock voxel_block(max_num_points_in_voxel);
-      voxel_block.AddPoint(point);
-      map[voxel(kx, ky, kz)] = std::move(voxel_block);
-
-      if (add_point) {
-        std::lock_guard<std::mutex> lock(*img_pro->map_tracker->mutex_rgb_points_vec);
-        point.point_index = img_pro->map_tracker->rgb_points_vec.size();
-        img_pro->map_tracker->rgb_points_vec.push_back(&map[voxel(kx, ky, kz)].points.back());
-        hashmap_3d_points.insert(point_map_kx, point_map_ky, point_map_kz, img_pro->map_tracker->rgb_points_vec.back());
-      }
-
-      if (fabs(p_frame->time_sweep_end - img_pro->time_last_process) > 1e-5 &&
-          fabs(map[voxel(kx, ky, kz)].last_visited_time - p_frame->time_sweep_end) > 1e-5) {
-        map[voxel(kx, ky, kz)].last_visited_time = p_frame->time_sweep_end;
-        voxels_recent_visited_temp.push_back(voxelId(kx, ky, kz));
-      }
     }
   }
 }
+}
 
+/**
+ * 将点云数据添加到体素哈希地图中
+ * @param map 体素哈希地图引用
+ * @param p_frame 当前点云帧指针
+ * @param voxel_size 体素大小
+ * @param max_num_points_in_voxel 每个体素允许的最大点数
+ * @param min_distance_points 点之间的最小距离阈值
+ * @param min_num_points 最小点数要求
+ * @param to_rendering 是否需要进行渲染处理
+ */
 void lioOptimization::addPointsToMap(
-    voxelHashMap& map,
-    cloudFrame* p_frame,
-    double voxel_size,
-    int max_num_points_in_voxel,
-    double min_distance_points,
-    int min_num_points,
-    bool to_rendering) {
-  if (to_rendering) {
-    voxels_recent_visited_temp.clear();
-    std::vector<voxelId>().swap(voxels_recent_visited_temp);
-  }
+  voxelHashMap& map,
+  cloudFrame* p_frame,
+  double voxel_size,
+  int max_num_points_in_voxel,
+  double min_distance_points,
+  int min_num_points,
+  bool to_rendering) {
 
-  int number_of_voxels_before_add = voxels_recent_visited_temp.size();
+// === 渲染相关的初始化 ===
+if (to_rendering) {
+  // 清空最近访问的体素临时列表，为新的渲染周期做准备
+  voxels_recent_visited_temp.clear();
+  std::vector<voxelId>().swap(voxels_recent_visited_temp);  // 释放内存
+}
 
-  int point_idx = 0;
+// 记录添加新点之前的体素数量，用于计算新增体素数
+int number_of_voxels_before_add = voxels_recent_visited_temp.size();
 
-  for (const auto& point : p_frame->point_frame) {
-    rgbPoint rgb_point(point.point);
-    addPointToMap(map, rgb_point, voxel_size, max_num_points_in_voxel, min_distance_points, min_num_points, p_frame);
+// 点索引计数器，用于控制添加到颜色地图的频率
+int point_idx = 0;
 
-    if (point_idx % map_options.add_point_step == 0)
-      addPointToColorMap(
-          color_voxel_map,
-          rgb_point,
-          map_options.size_voxel_map,
-          map_options.max_num_points_in_voxel,
-          map_options.min_distance_points,
-          0,
-          p_frame,
-          voxels_recent_visited_temp);
+// === 遍历点云帧中的每个点 ===
+for (const auto& point : p_frame->point_frame) {
+  // 将3D点转换为包含RGB信息的点结构
+  rgbPoint rgb_point(point.point);
+  
+  // 将当前点添加到主地图中
+  // 这里会根据体素化策略将点分配到相应的体素中
+  addPointToMap(map, rgb_point, voxel_size, max_num_points_in_voxel, 
+                min_distance_points, min_num_points, p_frame);
 
-    point_idx++;
-  }
+  // === 按步长添加点到颜色地图 ===
+  // 为了减少计算负担，不是每个点都添加到颜色地图中
+  if (point_idx % map_options.add_point_step == 0)
+    addPointToColorMap(
+        color_voxel_map,                        // 颜色体素地图
+        rgb_point,                              // RGB点数据
+        map_options.size_voxel_map,             // 地图体素大小
+        map_options.max_num_points_in_voxel,    // 体素最大点数
+        map_options.min_distance_points,        // 最小点距离
+        0,                                      // 最小点数（这里设为0）
+        p_frame,                                // 当前帧
+        voxels_recent_visited_temp);            // 最近访问的体素列表
 
-  if (to_rendering) {
-    img_pro->map_tracker->voxels_recent_visited.clear();
-    std::vector<voxelId>().swap(img_pro->map_tracker->voxels_recent_visited);
-    img_pro->map_tracker->voxels_recent_visited = voxels_recent_visited_temp;
-    img_pro->map_tracker->number_of_new_visited_voxel =
-        img_pro->map_tracker->voxels_recent_visited.size() - number_of_voxels_before_add;
-  }
+  point_idx++;  // 递增点索引
+}
 
-  if (ENABLE_PUBLISH) {
-    publishCLoudWorld(pub_cloud_world, points_world, p_frame);
-  }
-  points_world->clear();
+// === 更新渲染相关数据 ===
+if (to_rendering) {
+  // 清空图像处理器中的最近访问体素列表
+  img_pro->map_tracker->voxels_recent_visited.clear();
+  std::vector<voxelId>().swap(img_pro->map_tracker->voxels_recent_visited);
+  
+  // 将临时的最近访问体素列表传递给图像处理器
+  img_pro->map_tracker->voxels_recent_visited = voxels_recent_visited_temp;
+  
+  // 计算本次新增的体素数量
+  img_pro->map_tracker->number_of_new_visited_voxel =
+      img_pro->map_tracker->voxels_recent_visited.size() - number_of_voxels_before_add;
+}
+
+// === 发布点云数据到ROS话题 ===
+if (ENABLE_PUBLISH) {
+  // 将世界坐标系下的点云发布出去，供其他节点使用
+  publishCLoudWorld(pub_cloud_world, points_world, p_frame);
+}
+
+// 清空世界点云容器，为下一帧做准备
+points_world->clear();
 }
 
 void lioOptimization::removePointsFarFromLocation(voxelHashMap& map, const Eigen::Vector3d& location, double distance) {
@@ -988,103 +1075,167 @@ void lioOptimization::makePointTimestamp(std::vector<point3D>& sweep, double tim
   }
 }
 
+/**
+ * 构建点云帧函数
+ * 对原始点云数据进行预处理，包括运动补偿、采样、坐标变换等操作
+ * @param cut_sweep 切片后的点云数据
+ * @param cur_state 当前状态（位姿）
+ * @param timestamp_begin 时间戳起始时间
+ * @param timestamp_offset 时间戳偏移量
+ * @return 构建完成的点云帧指针
+ */
 cloudFrame* lioOptimization::buildFrame(
-    std::vector<point3D>& cut_sweep,
-    state* cur_state,
-    double timestamp_begin,
-    double timestamp_offset) {
-  std::vector<point3D> frame(cut_sweep);
+  std::vector<point3D>& cut_sweep,
+  state* cur_state,
+  double timestamp_begin,
+  double timestamp_offset) {
 
-  double offset_begin = 0;
-  double offset_end = timestamp_offset;
+// 复制输入的点云数据到局部变量，避免修改原始数据
+std::vector<point3D> frame(cut_sweep);
 
-  double time_sweep_begin = timestamp_begin;
-  double time_frame_begin = timestamp_begin;
+// 设置时间偏移量
+double offset_begin = 0;                    // 起始偏移量（通常为0）
+double offset_end = timestamp_offset;       // 结束偏移量
 
-  makePointTimestamp(frame, time_frame_begin, timestamp_begin + timestamp_offset);
+// 设置时间戳
+double time_sweep_begin = timestamp_begin;  // 扫描开始时间
+double time_frame_begin = timestamp_begin;  // 帧开始时间
 
-  if (odometry_options.motion_compensation == CONSTANT_VELOCITY)
-    distortFrameByConstant(frame, imu_states, time_frame_begin, R_imu_lidar, t_imu_lidar);
-  else if (odometry_options.motion_compensation == IMU)
-    distortFrameByImu(frame, imu_states, time_frame_begin, R_imu_lidar, t_imu_lidar);
+// === 为点云中的每个点分配相对时间戳 ===
+// 根据点云扫描的时间范围，为每个点计算相对时间和时间比例
+makePointTimestamp(frame, time_frame_begin, timestamp_begin + timestamp_offset);
 
-  double sample_size =
-      index_frame < odometry_options.init_num_frames ? odometry_options.init_voxel_size : odometry_options.voxel_size;
+// === 运动补偿：校正由于载体运动导致的点云失真 ===
+if (odometry_options.motion_compensation == CONSTANT_VELOCITY)
+  // 使用恒定速度模型进行运动补偿
+  distortFrameByConstant(frame, imu_states, time_frame_begin, R_imu_lidar, t_imu_lidar);
+else if (odometry_options.motion_compensation == IMU)
+  // 使用IMU数据进行高精度运动补偿
+  distortFrameByImu(frame, imu_states, time_frame_begin, R_imu_lidar, t_imu_lidar);
 
-  std::default_random_engine engine(std::chrono::system_clock::now().time_since_epoch().count());
+// === 确定采样体素大小 ===
+// 初始化阶段使用较小的体素，正常运行时使用较大的体素以提高效率
+double sample_size =
+    index_frame < odometry_options.init_num_frames ? odometry_options.init_voxel_size : odometry_options.voxel_size;
+
+// === 随机洗牌点云数据 ===
+// 使用当前时间作为随机种子，确保每次运行都有不同的随机性
+std::default_random_engine engine(std::chrono::system_clock::now().time_since_epoch().count());
+std::shuffle(frame.begin(), frame.end(), engine);
+
+// === 体素化下采样 ===
+if (odometry_options.voxel_size > 0) {
+  // 对点云进行体素下采样，减少数据量并保持空间分布特性
+  subSampleFrame(frame, sample_size);
+  
+  // 再次洗牌，确保采样后的点云分布随机性
   std::shuffle(frame.begin(), frame.end(), engine);
-
-  if (odometry_options.voxel_size > 0) {
-    subSampleFrame(frame, sample_size);
-
-    std::shuffle(frame.begin(), frame.end(), engine);
-  }
-
-  transformAllImuPoint(frame, imu_states, R_imu_lidar, t_imu_lidar);
-
-  double dt_offset = 0;
-
-  if (index_frame > 1)
-    dt_offset -= time_frame_begin - all_cloud_frame.back()->time_sweep_end;
-
-  if (index_frame <= 2) {
-    for (auto& point_temp : frame) {
-      point_temp.alpha_time = 1.0;
-    }
-  }
-
-  if (index_frame > 2) {
-    for (auto& point_temp : frame) {
-      transformPoint(point_temp, cur_state->rotation, cur_state->translation, R_imu_lidar, t_imu_lidar);
-    }
-  } else {
-    for (auto& point_temp : frame) {
-      Eigen::Quaterniond q_identity = Eigen::Quaterniond::Identity();
-      Eigen::Vector3d t_zero = Eigen::Vector3d::Zero();
-      transformPoint(point_temp, q_identity, t_zero, R_imu_lidar, t_imu_lidar);
-    }
-  }
-
-  cloudFrame* p_frame = new cloudFrame(frame, cur_state);
-  p_frame->time_sweep_begin = time_sweep_begin;
-  p_frame->time_sweep_end = timestamp_begin + timestamp_offset;
-  p_frame->time_frame_begin = time_frame_begin;
-  p_frame->time_frame_end = p_frame->time_sweep_end;
-  p_frame->offset_begin = offset_begin;
-  p_frame->offset_end = offset_end;
-  p_frame->dt_offset = dt_offset;
-  p_frame->id = all_cloud_frame.size();
-  p_frame->sub_id = 0;
-  p_frame->frame_id = index_frame;
-
-  all_cloud_frame.push_back(p_frame);
-
-  return p_frame;
 }
 
+// === 将点云从激光雷达坐标系变换到IMU坐标系 ===
+transformAllImuPoint(frame, imu_states, R_imu_lidar, t_imu_lidar);
+
+// === 计算时间偏移 ===
+double dt_offset = 0;
+// 如果不是第一帧，计算与上一帧的时间间隔
+if (index_frame > 1)
+  dt_offset -= time_frame_begin - all_cloud_frame.back()->time_sweep_end;
+
+// === 处理前两帧的特殊情况 ===
+if (index_frame <= 2) {
+  // 前两帧将所有点的时间权重设为1.0（不进行时间插值）
+  for (auto& point_temp : frame) {
+    point_temp.alpha_time = 1.0;
+  }
+}
+
+// === 根据帧数进行不同的坐标变换 ===
+if (index_frame > 2) {
+  // 第三帧之后：使用当前状态估计进行坐标变换
+  for (auto& point_temp : frame) {
+    transformPoint(point_temp, cur_state->rotation, cur_state->translation, R_imu_lidar, t_imu_lidar);
+  }
+} else {
+  // 前两帧：使用单位变换（无旋转无平移）
+  for (auto& point_temp : frame) {
+    Eigen::Quaterniond q_identity = Eigen::Quaterniond::Identity();  // 单位四元数
+    Eigen::Vector3d t_zero = Eigen::Vector3d::Zero();               // 零向量
+    transformPoint(point_temp, q_identity, t_zero, R_imu_lidar, t_imu_lidar);
+  }
+}
+
+// === 创建新的点云帧对象 ===
+cloudFrame* p_frame = new cloudFrame(frame, cur_state);
+
+// === 设置帧的时间属性 ===
+p_frame->time_sweep_begin = time_sweep_begin;                    // 扫描开始时间
+p_frame->time_sweep_end = timestamp_begin + timestamp_offset;    // 扫描结束时间
+p_frame->time_frame_begin = time_frame_begin;                    // 帧开始时间
+p_frame->time_frame_end = p_frame->time_sweep_end;              // 帧结束时间
+
+// === 设置帧的偏移属性 ===
+p_frame->offset_begin = offset_begin;    // 起始偏移
+p_frame->offset_end = offset_end;        // 结束偏移
+p_frame->dt_offset = dt_offset;          // 时间偏移差值
+
+// === 设置帧的标识属性 ===
+p_frame->id = all_cloud_frame.size();   // 帧在全局列表中的ID
+p_frame->sub_id = 0;                     // 子帧ID（通常为0）
+p_frame->frame_id = index_frame;         // 当前帧索引
+
+// === 将构建好的帧添加到全局帧列表中 ===
+all_cloud_frame.push_back(p_frame);
+
+// 返回构建完成的帧指针
+return p_frame;
+}
+
+/**
+ * 状态初始化函数
+ * 根据当前帧数和初始化策略为新状态设置初始的旋转和平移
+ * @param cur_state 待初始化的状态指针
+ */
 void lioOptimization::stateInitialization(state* cur_state) {
+  // === 处理前两帧的情况 ===
   if (index_frame <= 2) {
-    cur_state->rotation = Eigen::Quaterniond::Identity();
-    cur_state->translation = Eigen::Vector3d::Zero();
-  } else if (index_frame == 3) {
+    // 前两帧使用单位四元数（无旋转）和零向量（无平移）作为初始状态
+    cur_state->rotation = Eigen::Quaterniond::Identity();     // 单位四元数，表示无旋转
+    cur_state->translation = Eigen::Vector3d::Zero();         // 零向量，表示无平移
+  } 
+  // === 处理第三帧的情况 ===
+  else if (index_frame == 3) {
+    // 根据初始化策略选择不同的初始化方法
     if (odometry_options.initialization == INIT_CONSTANT_VELOCITY) {
+      // 恒定速度模型初始化：根据前两帧的运动趋势预测当前帧状态
+      
+      // 计算从倒数第二帧到最后一帧的相对旋转
+      // q_rel = q_last * q_second_last^(-1)
+      // 然后应用这个相对旋转：q_next = q_rel * q_last
       Eigen::Quaterniond q_next_end = all_cloud_frame[all_cloud_frame.size() - 1]->p_state->rotation *
                                       all_cloud_frame[all_cloud_frame.size() - 2]->p_state->rotation.inverse() *
                                       all_cloud_frame[all_cloud_frame.size() - 1]->p_state->rotation;
 
+      // 计算平移预测：基于恒定速度假设
+      // t_next = t_last + R_last * R_second_last^(-1) * (t_last - t_second_last)
+      // 这里考虑了旋转对平移向量的影响
       Eigen::Vector3d t_next_end = all_cloud_frame[all_cloud_frame.size() - 1]->p_state->translation +
                                    all_cloud_frame[all_cloud_frame.size() - 1]->p_state->rotation *
                                        all_cloud_frame[all_cloud_frame.size() - 2]->p_state->rotation.inverse() *
                                        (all_cloud_frame[all_cloud_frame.size() - 1]->p_state->translation -
                                         all_cloud_frame[all_cloud_frame.size() - 2]->p_state->translation);
 
+      // 设置预测的状态
       cur_state->rotation = q_next_end;
       cur_state->translation = t_next_end;
-    } else if (odometry_options.initialization == INIT_IMU) {
+    } 
+    else if (odometry_options.initialization == INIT_IMU) {
+      // IMU初始化策略
       if (initial_flag) {
+        // 如果ESKF已经初始化完成，直接使用ESKF的估计结果
         cur_state->rotation = eskf_pro->getRotation();
         cur_state->translation = eskf_pro->getTranslation();
       } else {
+        // 如果ESKF尚未初始化，回退到恒定速度模型
         Eigen::Quaterniond q_next_end = all_cloud_frame[all_cloud_frame.size() - 1]->p_state->rotation *
                                         all_cloud_frame[all_cloud_frame.size() - 2]->p_state->rotation.inverse() *
                                         all_cloud_frame[all_cloud_frame.size() - 1]->p_state->rotation;
@@ -1099,11 +1250,16 @@ void lioOptimization::stateInitialization(state* cur_state) {
         cur_state->translation = t_next_end;
       }
     } else {
+      // 其他初始化策略：直接复制上一帧的状态（静止假设）
       cur_state->rotation = all_cloud_frame[all_cloud_frame.size() - 1]->p_state->rotation;
       cur_state->translation = all_cloud_frame[all_cloud_frame.size() - 1]->p_state->translation;
     }
-  } else {
+  } 
+  // === 处理第三帧之后的情况 ===
+  else {
+    // 第三帧之后的处理逻辑与第三帧相同，但此时已有足够的历史数据
     if (odometry_options.initialization == INIT_CONSTANT_VELOCITY) {
+      // 恒定速度模型：基于最近两帧的运动趋势预测
       Eigen::Quaterniond q_next_end = all_cloud_frame[all_cloud_frame.size() - 1]->p_state->rotation *
                                       all_cloud_frame[all_cloud_frame.size() - 2]->p_state->rotation.inverse() *
                                       all_cloud_frame[all_cloud_frame.size() - 1]->p_state->rotation;
@@ -1116,11 +1272,15 @@ void lioOptimization::stateInitialization(state* cur_state) {
 
       cur_state->rotation = q_next_end;
       cur_state->translation = t_next_end;
-    } else if (odometry_options.initialization == INIT_IMU) {
+    } 
+    else if (odometry_options.initialization == INIT_IMU) {
+      // IMU初始化策略
       if (initial_flag) {
+        // 优先使用ESKF的高精度估计结果
         cur_state->rotation = eskf_pro->getRotation();
         cur_state->translation = eskf_pro->getTranslation();
       } else {
+        // ESKF未初始化时的备用方案：恒定速度模型
         Eigen::Quaterniond q_next_end = all_cloud_frame[all_cloud_frame.size() - 1]->p_state->rotation *
                                         all_cloud_frame[all_cloud_frame.size() - 2]->p_state->rotation.inverse() *
                                         all_cloud_frame[all_cloud_frame.size() - 1]->p_state->rotation;
@@ -1135,46 +1295,85 @@ void lioOptimization::stateInitialization(state* cur_state) {
         cur_state->translation = t_next_end;
       }
     } else {
+      // 默认策略：直接使用上一帧状态（适用于静止或缓慢运动场景）
       cur_state->rotation = all_cloud_frame[all_cloud_frame.size() - 1]->p_state->rotation;
       cur_state->translation = all_cloud_frame[all_cloud_frame.size() - 1]->p_state->translation;
     }
   }
 }
 
+/**
+ * 状态估计函数
+ * 对当前帧进行位姿估计和优化，并将点云添加到全局地图中
+ * @param p_frame 当前点云帧指针
+ * @param to_rendering 是否需要进行渲染相关处理
+ * @return 优化结果摘要
+ */
 optimizeSummary lioOptimization::stateEstimation(cloudFrame* p_frame, bool to_rendering) {
-  icpOptions optimize_options = odometry_options.optimize_options;
-  const double kSizeVoxelInitSample = odometry_options.voxel_size;
+  // === 获取优化配置参数 ===
+  icpOptions optimize_options = odometry_options.optimize_options;  // ICP优化选项
+  const double kSizeVoxelInitSample = odometry_options.voxel_size;  // 初始采样体素大小
 
-  const double kSizeVoxelMap = optimize_options.size_voxel_map;
-  const double kMinDistancePoints = odometry_options.min_distance_points;
-  const int kMaxNumPointsInVoxel = odometry_options.max_num_points_in_voxel;
+  // === 设置地图构建相关常量 ===
+  const double kSizeVoxelMap = optimize_options.size_voxel_map;           // 地图体素大小
+  const double kMinDistancePoints = odometry_options.min_distance_points; // 点之间的最小距离
+  const int kMaxNumPointsInVoxel = odometry_options.max_num_points_in_voxel; // 每个体素的最大点数
 
+  // 初始化优化结果摘要
   optimizeSummary optimize_summary;
 
+  // === 根据帧ID决定处理策略 ===
   if (p_frame->frame_id > 1) {
-    bool good_enough_registration = false;
+    // === 非首帧：进行基于ICP的位姿优化 ===
+    
+    bool good_enough_registration = false;  // 配准质量标志（未使用）
+    
+    // 根据是否在初始化阶段选择不同的体素大小
+    // 初始化阶段使用更小的体素以获得更高精度
     double sample_voxel_size = p_frame->frame_id < odometry_options.init_num_frames
-                                   ? odometry_options.init_sample_voxel_size
-                                   : odometry_options.sample_voxel_size;
+                                   ? odometry_options.init_sample_voxel_size  // 初始化阶段体素大小
+                                   : odometry_options.sample_voxel_size;      // 正常运行体素大小
+    
+    // 计算最小体素大小（用于确保数值稳定性）
     double min_voxel_size = std::min(odometry_options.init_voxel_size, odometry_options.voxel_size);
 
+    // === 执行ICP优化 ===
+    // 使用点到平面的ICP算法优化当前帧的位姿
     optimize_summary = optimize(p_frame, optimize_options, sample_voxel_size);
 
+    // === 检查优化是否成功 ===
     if (!optimize_summary.success) {
+      // 如果优化失败，直接返回失败结果
       return optimize_summary;
     }
   } else {
-    p_frame->p_state->translation = eskf_pro->getTranslation();
-    p_frame->p_state->rotation = eskf_pro->getRotation();
-    p_frame->p_state->velocity = eskf_pro->getVelocity();
-    p_frame->p_state->ba = eskf_pro->getBa();
-    p_frame->p_state->bg = eskf_pro->getBg();
+    // === 首帧处理：直接使用ESKF估计结果 ===
+    // 首帧没有历史信息进行ICP配准，直接使用IMU积分结果
+    
+    p_frame->p_state->translation = eskf_pro->getTranslation();  // 位置
+    p_frame->p_state->rotation = eskf_pro->getRotation();        // 姿态
+    p_frame->p_state->velocity = eskf_pro->getVelocity();        // 速度
+    p_frame->p_state->ba = eskf_pro->getBa();                    // 加速度计偏置
+    p_frame->p_state->bg = eskf_pro->getBg();                    // 陀螺仪偏置
+    
+    // 更新重力向量（用于后续的重力对齐）
     G = eskf_pro->getGravity();
-    G_norm = G.norm();
+    G_norm = G.norm();  // 重力向量的模长
   }
 
+  // === 将当前帧的点云添加到全局地图 ===
+  // 这一步将经过状态估计的点云数据加入到全局体素地图中
+  // 参数说明：
+  // - voxel_map: 全局体素地图
+  // - p_frame: 当前帧
+  // - kSizeVoxelMap: 地图体素大小
+  // - kMaxNumPointsInVoxel: 每个体素最大点数
+  // - kMinDistancePoints: 点间最小距离
+  // - 0: 最小点数阈值（0表示无限制）
+  // - to_rendering: 是否用于渲染
   addPointsToMap(voxel_map, p_frame, kSizeVoxelMap, kMaxNumPointsInVoxel, kMinDistancePoints, 0, to_rendering);
 
+  // 返回优化结果摘要
   return optimize_summary;
 }
 
@@ -1316,177 +1515,218 @@ void lioOptimization::gsPointCloudUpdate(
   }
 }
 
+/**
+ * 处理点云扫描数据，进行状态估计和3D高斯重建
+ * @param cut_sweep 切片后的点云数据
+ * @param timestamp_begin 时间戳起始
+ * @param timestamp_offset 时间戳偏移
+ * @param cur_image 当前图像
+ * @param to_rendering 是否需要渲染
+ */
 void lioOptimization::process(
-    std::vector<point3D>& cut_sweep,
-    double timestamp_begin,
-    double timestamp_offset,
-    cv::Mat& cur_image,
-    bool to_rendering) {
-  state* cur_state = new state();
+  std::vector<point3D>& cut_sweep,
+  double timestamp_begin,
+  double timestamp_offset,
+  cv::Mat& cur_image,
+  bool to_rendering) {
 
-  std::vector<point3D> const_frame;
+// 创建新的状态对象
+state* cur_state = new state();
 
-  common::Timer::Evaluate(
-      gp_options_.log_time, ros::Time::now().toSec(), [&]() { stateInitialization(cur_state); }, "stateInitialization");
+// 创建常量帧副本
+std::vector<point3D> const_frame;
 
-  const_frame.insert(const_frame.end(), cut_sweep.begin(), cut_sweep.end());
+// 计时器：执行状态初始化
+common::Timer::Evaluate(
+    gp_options_.log_time, ros::Time::now().toSec(), 
+    [&]() { stateInitialization(cur_state); }, 
+    "stateInitialization");
 
-  cloudFrame* p_frame;
-  common::Timer::Evaluate(
-      gp_options_.log_time,
-      ros::Time::now().toSec(),
-      [&]() { p_frame = buildFrame(const_frame, cur_state, timestamp_begin, timestamp_offset); },
-      "buildFrame");
-  dt_sum = 0;
+// 将扫描数据复制到常量帧中
+const_frame.insert(const_frame.end(), cut_sweep.begin(), cut_sweep.end());
 
+// 构建点云帧
+cloudFrame* p_frame;
+common::Timer::Evaluate(
+    gp_options_.log_time,
+    ros::Time::now().toSec(),
+    [&]() { p_frame = buildFrame(const_frame, cur_state, timestamp_begin, timestamp_offset); },
+    "buildFrame");
+dt_sum = 0; // 重置时间累积
+
+// 计时器：执行状态估计和相机参数设置
+common::Timer::Evaluate(
+    gp_options_.log_time,
+    ros::Time::now().toSec(),
+    [&]() {
+      // 执行状态估计
+      stateEstimation(p_frame, to_rendering);
+
+      // 设置相机内参
+      if (all_cloud_frame.size() < 3) {
+        // 如果帧数少于3，使用初始相机内参
+        p_frame->p_state->fx = img_pro->getCameraIntrinsic()(0, 0);
+        p_frame->p_state->fy = img_pro->getCameraIntrinsic()(1, 1);
+        p_frame->p_state->cx = img_pro->getCameraIntrinsic()(0, 2);
+        p_frame->p_state->cy = img_pro->getCameraIntrinsic()(1, 2);
+
+        p_frame->p_state->R_imu_camera = R_imu_camera;
+        p_frame->p_state->t_imu_camera = t_imu_camera;
+      } else {
+        // 使用前一帧的相机参数
+        p_frame->p_state->fx = all_cloud_frame[all_cloud_frame.size() - 2]->p_state->fx;
+        p_frame->p_state->fy = all_cloud_frame[all_cloud_frame.size() - 2]->p_state->fy;
+        p_frame->p_state->cx = all_cloud_frame[all_cloud_frame.size() - 2]->p_state->cx;
+        p_frame->p_state->cy = all_cloud_frame[all_cloud_frame.size() - 2]->p_state->cy;
+
+        p_frame->p_state->R_imu_camera = all_cloud_frame[all_cloud_frame.size() - 2]->p_state->R_imu_camera;
+        p_frame->p_state->t_imu_camera = all_cloud_frame[all_cloud_frame.size() - 2]->p_state->t_imu_camera;
+      }
+
+      // 计算世界坐标系到相机坐标系的变换
+      p_frame->p_state->q_world_camera =
+          Eigen::Quaterniond(p_frame->p_state->rotation.toRotationMatrix() * p_frame->p_state->R_imu_camera);
+      p_frame->p_state->t_world_camera =
+          p_frame->p_state->rotation.toRotationMatrix() * p_frame->p_state->t_imu_camera +
+          p_frame->p_state->translation;
+      
+      // 刷新用于投影的位姿
+      p_frame->refreshPoseForProjection();
+
+      // 如果需要渲染，设置RGB图像并处理
+      if (to_rendering) {
+        p_frame->rgb_image = cur_image;
+        img_pro->process(color_voxel_map, p_frame);
+      }
+    },
+    "StateEstimation_verbose");
+
+// 如果需要渲染，执行以下操作
+if (to_rendering) {
+  // 计时器：高斯相机扩展
   common::Timer::Evaluate(
       gp_options_.log_time,
       ros::Time::now().toSec(),
       [&]() {
-        stateEstimation(p_frame, to_rendering);
+        // 判断是否需要添加新相机（基于位移和旋转变化阈值）
+        if (image_frame_id == 0 || compareStatesImageAdd(
+                                       last_image_rotation,
+                                       last_image_trans,
+                                       last_image_time,
+                                       p_frame->p_state->rotation,
+                                       p_frame->p_state->translation,
+                                       p_frame->time_frame_begin)) {
+          // 添加新相机到高斯相机列表
+          std::vector<Camera> add_cams;
+          gsAddCamera(p_frame, add_cams);
+          _cameras.push_back(add_cams);
 
-        if (all_cloud_frame.size() < 3) {
-          p_frame->p_state->fx = img_pro->getCameraIntrinsic()(0, 0);
-          p_frame->p_state->fy = img_pro->getCameraIntrinsic()(1, 1);
-          p_frame->p_state->cx = img_pro->getCameraIntrinsic()(0, 2);
-          p_frame->p_state->cy = img_pro->getCameraIntrinsic()(1, 2);
-
-          p_frame->p_state->R_imu_camera = R_imu_camera;
-          p_frame->p_state->t_imu_camera = t_imu_camera;
-        } else {
-          p_frame->p_state->fx = all_cloud_frame[all_cloud_frame.size() - 2]->p_state->fx;
-          p_frame->p_state->fy = all_cloud_frame[all_cloud_frame.size() - 2]->p_state->fy;
-          p_frame->p_state->cx = all_cloud_frame[all_cloud_frame.size() - 2]->p_state->cx;
-          p_frame->p_state->cy = all_cloud_frame[all_cloud_frame.size() - 2]->p_state->cy;
-
-          p_frame->p_state->R_imu_camera = all_cloud_frame[all_cloud_frame.size() - 2]->p_state->R_imu_camera;
-          p_frame->p_state->t_imu_camera = all_cloud_frame[all_cloud_frame.size() - 2]->p_state->t_imu_camera;
-        }
-
-        p_frame->p_state->q_world_camera =
-            Eigen::Quaterniond(p_frame->p_state->rotation.toRotationMatrix() * p_frame->p_state->R_imu_camera);
-        p_frame->p_state->t_world_camera =
-            p_frame->p_state->rotation.toRotationMatrix() * p_frame->p_state->t_imu_camera +
-            p_frame->p_state->translation;
-        p_frame->refreshPoseForProjection();
-
-        if (to_rendering) {
-          p_frame->rgb_image = cur_image;
-          img_pro->process(color_voxel_map, p_frame);
+          // 更新上次图像的状态
+          last_image_rotation = p_frame->p_state->rotation;
+          last_image_trans = p_frame->p_state->translation;
+          last_image_time = p_frame->time_frame_begin;
         }
       },
-      "StateEstimation_verbose");
-  if (to_rendering) {
-    common::Timer::Evaluate(
-        gp_options_.log_time,
-        ros::Time::now().toSec(),
-        [&]() {
-          if (image_frame_id == 0 || compareStatesImageAdd(
-                                         last_image_rotation,
-                                         last_image_trans,
-                                         last_image_time,
-                                         p_frame->p_state->rotation,
-                                         p_frame->p_state->translation,
-                                         p_frame->time_frame_begin)) {
-            std::vector<Camera> add_cams;
-            gsAddCamera(p_frame, add_cams);
+      "GS_CameraExpansion_verbose");
 
-            _cameras.push_back(add_cams);
+  // 构建地图和计算损失
+  GSLIVM::GsForMaps final_gs_sample;      // 用于地图的高斯样本
+  GSLIVM::GsForLosses final_gs_calc_loss; // 用于损失计算的高斯数据
+  int updated_voxel_count = 0;
+  
+  // 计时器：高斯地图扩展
+  common::Timer::Evaluate(
+      gp_options_.log_time,
+      ros::Time::now().toSec(),
+      [&]() { gsPointCloudUpdate(p_frame, updated_voxel_count, final_gs_sample, final_gs_calc_loss); },
+      "GS_MapExpansion_verbose");
 
-            last_image_rotation = p_frame->p_state->rotation;
-            last_image_trans = p_frame->p_state->translation;
-            last_image_time = p_frame->time_frame_begin;
-          }
-        },
-        "GS_CameraExpansion_verbose");
-
-    // build map and calculate loss
-    GSLIVM::GsForMaps final_gs_sample;
-    GSLIVM::GsForLosses final_gs_calc_loss;
-    int updated_voxel_count = 0;
-    common::Timer::Evaluate(
-        gp_options_.log_time,
-        ros::Time::now().toSec(),
-        [&]() { gsPointCloudUpdate(p_frame, updated_voxel_count, final_gs_sample, final_gs_calc_loss); },
-        "GS_MapExpansion_verbose");
-
-    // add initial gaussians into map queue
-    if (final_gs_sample.gs_xyzs.size(0) != 0) {
-      std::lock_guard<std::mutex> lock(gs_point_for_map_mutex);
-      new_gs_for_map_points.push_back(final_gs_sample);
-      new_gs_points_for_map_count += final_gs_sample.gs_xyzs.size(0);
-    }
-
-    // add initial gaussians into loss queue
-    if (final_gs_calc_loss._losses.size() != 0) {
-      std::lock_guard<std::mutex> lock(gs_point_for_loss_mutex);
-      new_gs_for_loss_points.push_back(final_gs_calc_loss);
-    }
-
-    if (!is_gs_started && new_gs_points_for_map_count > 1000) {
-      GSLIVM::GsForMaps all_gs;
-      processAndMergePointClouds(all_gs);
-
-      gaussian_pro->Create_from_pcd(gsoptimParams, all_gs, 1.f);
-      gaussian_pro->Training_setup(gsoptimParams);
-
-      // warm up
-      {
-        auto [image, depth, depth_sol] = render(_cameras[0][0], gaussian_pro, background);
-        auto gt_image = _cameras[0][0].Get_original_image().to(torch::kCUDA, true);
-        auto ssim_loss = gaussian_splatting::ssim(image, gt_image, conv_window, window_size, channel);
-
-        ssim_loss.backward();
-        gaussian_pro->_optimizer->step();
-        gaussian_pro->_optimizer->zero_grad(true);
-      }
-      is_gs_started = true;
-    } else {
-    }
-    image_frame_id++;
+  // 将初始高斯点添加到地图队列
+  if (final_gs_sample.gs_xyzs.size(0) != 0) {
+    std::lock_guard<std::mutex> lock(gs_point_for_map_mutex);
+    new_gs_for_map_points.push_back(final_gs_sample);
+    new_gs_points_for_map_count += final_gs_sample.gs_xyzs.size(0);
   }
 
-  if (ENABLE_PUBLISH) {
-    publish_path(pub_path, p_frame);
+  // 将初始高斯点添加到损失计算队列
+  if (final_gs_calc_loss._losses.size() != 0) {
+    std::lock_guard<std::mutex> lock(gs_point_for_loss_mutex);
+    new_gs_for_loss_points.push_back(final_gs_calc_loss);
   }
 
-  if (debug_output) {
-    pcl::PointCloud<pcl::PointXYZINormal>::Ptr p_cloud_temp;
-    p_cloud_temp.reset(new pcl::PointCloud<pcl::PointXYZINormal>());
-    point3DtoPCL(p_frame->point_frame, p_cloud_temp);
+  // 如果高斯未启动且积累的点数超过阈值，初始化高斯模型
+  if (!is_gs_started && new_gs_points_for_map_count > 1000) {
+    GSLIVM::GsForMaps all_gs;
+    processAndMergePointClouds(all_gs); // 处理并合并点云
 
-    std::string pcd_path(output_path + "/cloud_frame/" + std::to_string(index_frame) + std::string(".pcd"));
-    saveCutCloud(pcd_path, p_cloud_temp);
-  }
+    // 从点云创建高斯模型
+    gaussian_pro->Create_from_pcd(gsoptimParams, all_gs, 1.f);
+    gaussian_pro->Training_setup(gsoptimParams);
 
-  int num_remove = 0;
+    // 预热：执行一次渲染和优化
+    {
+      auto [image, depth, depth_sol] = render(_cameras[0][0], gaussian_pro, background);
+      auto gt_image = _cameras[0][0].Get_original_image().to(torch::kCUDA, true);
+      auto ssim_loss = gaussian_splatting::ssim(image, gt_image, conv_window, window_size, channel);
 
-  if (initial_flag) {
-    if (index_frame > 1) {
-      while (all_cloud_frame.size() > 2) {
-        if (gp_options_.debug) {
-          recordSinglePose(all_cloud_frame[0]);
-        }
-        all_cloud_frame[0]->release();
-        all_cloud_frame.erase(all_cloud_frame.begin());
-        num_remove++;
-      }
-      assert(all_cloud_frame.size() == 2);
+      ssim_loss.backward();           // 反向传播
+      gaussian_pro->_optimizer->step(); // 优化器步进
+      gaussian_pro->_optimizer->zero_grad(true); // 清零梯度
     }
+    is_gs_started = true; // 标记高斯已启动
   } else {
-    while (all_cloud_frame.size() > odometry_options.num_for_initialization) {
+    // 占位分支
+  }
+  image_frame_id++; // 递增图像帧ID
+}
+
+// 如果启用发布，发布路径
+if (ENABLE_PUBLISH) {
+  publish_path(pub_path, p_frame);
+}
+
+// 如果启用调试输出，保存点云文件
+if (debug_output) {
+  pcl::PointCloud<pcl::PointXYZINormal>::Ptr p_cloud_temp;
+  p_cloud_temp.reset(new pcl::PointCloud<pcl::PointXYZINormal>());
+  point3DtoPCL(p_frame->point_frame, p_cloud_temp);
+
+  std::string pcd_path(output_path + "/cloud_frame/" + std::to_string(index_frame) + std::string(".pcd"));
+  saveCutCloud(pcd_path, p_cloud_temp);
+}
+
+// 清理旧的云帧以节省内存
+int num_remove = 0;
+
+if (initial_flag) {
+  // 如果已初始化，保持最多2个帧
+  if (index_frame > 1) {
+    while (all_cloud_frame.size() > 2) {
       if (gp_options_.debug) {
-        recordSinglePose(all_cloud_frame[0]);
+        recordSinglePose(all_cloud_frame[0]); // 记录位姿
       }
-      all_cloud_frame[0]->release();
-      all_cloud_frame.erase(all_cloud_frame.begin());
+      all_cloud_frame[0]->release(); // 释放内存
+      all_cloud_frame.erase(all_cloud_frame.begin()); // 删除帧
       num_remove++;
     }
+    assert(all_cloud_frame.size() == 2); // 确保只剩2个帧
   }
+} else {
+  // 未初始化时，保持不超过初始化所需的帧数
+  while (all_cloud_frame.size() > odometry_options.num_for_initialization) {
+    if (gp_options_.debug) {
+      recordSinglePose(all_cloud_frame[0]);
+    }
+    all_cloud_frame[0]->release();
+    all_cloud_frame.erase(all_cloud_frame.begin());
+    num_remove++;
+  }
+}
 
-  for (int i = 0; i < all_cloud_frame.size(); i++) {
-    all_cloud_frame[i]->id = all_cloud_frame[i]->id - num_remove;
-  }
+// 更新剩余帧的ID
+for (int i = 0; i < all_cloud_frame.size(); i++) {
+  all_cloud_frame[i]->id = all_cloud_frame[i]->id - num_remove;
+}
 }
 
 void lioOptimization::optimize_vis() {
@@ -2286,26 +2526,38 @@ void lioOptimization::saveColorPoints() {
   pcl::io::savePCDFileBinary(pcd_path, pcd_rgb);
 }
 
+/**
+ * LIO优化系统的主运行循环
+ * 负责处理传感器数据融合、状态估计和SLAM
+ */
 void lioOptimization::run() {
   while (true) {
+    // 检查线程停止标志
     if (stop_thread) {
       std::cout << "Stop run thread." << std::endl;
       break;
     }
 
+    // 获取同步后的测量数据（包含IMU、激光雷达、图像数据）
     std::vector<Measurements> measurements = getMeasurements();
 
+    // 遍历处理每个测量数据包
     for (auto& measurement : measurements) {
-      // process
-      double time_frame = measurement.time_image;
+      // 处理当前测量数据
+      double time_frame = measurement.time_image;  // 当前帧时间戳
+      // 初始化IMU数据变量
       double dx = 0, dy = 0, dz = 0, rx = 0, ry = 0, rz = 0;
 
+      // === 系统未初始化阶段 ===
       if (!initial_flag) {
+        // 遍历当前测量中的所有IMU数据
         for (auto& imu_msg : measurement.imu_measurements) {
           double time_imu = imu_msg->header.stamp.toSec();
 
+          // 如果IMU时间戳早于或等于图像时间戳
           if (time_imu <= time_frame) {
             current_time = time_imu;
+            // 直接使用IMU数据
             dx = imu_msg->linear_acceleration.x;
             dy = imu_msg->linear_acceleration.y;
             dz = imu_msg->linear_acceleration.z;
@@ -2313,17 +2565,25 @@ void lioOptimization::run() {
             ry = imu_msg->angular_velocity.y;
             rz = imu_msg->angular_velocity.z;
 
+            // 将IMU测量数据添加到初始化缓存中
             imu_meas.emplace_back(
                 current_time, std::make_pair(Eigen::Vector3d(rx, ry, rz), Eigen::Vector3d(dx, dy, dz)));
           } else {
-            double dt_1 = time_frame - current_time;
-            double dt_2 = time_imu - time_frame;
+            // 如果IMU时间戳晚于图像时间戳，需要进行时间插值
+            double dt_1 = time_frame - current_time;     // 当前时间到图像时间的间隔
+            double dt_2 = time_imu - time_frame;         // 图像时间到IMU时间的间隔
             current_time = time_frame;
+            
+            // 断言确保时间间隔有效
             assert(dt_1 >= 0);
             assert(dt_2 >= 0);
             assert(dt_1 + dt_2 > 0);
+            
+            // 计算线性插值权重
             double w1 = dt_2 / (dt_1 + dt_2);
             double w2 = dt_1 / (dt_1 + dt_2);
+            
+            // 对IMU数据进行线性插值
             dx = w1 * dx + w2 * imu_msg->linear_acceleration.x;
             dy = w1 * dy + w2 * imu_msg->linear_acceleration.y;
             dz = w1 * dz + w2 * imu_msg->linear_acceleration.z;
@@ -2331,31 +2591,39 @@ void lioOptimization::run() {
             ry = w1 * ry + w2 * imu_msg->angular_velocity.y;
             rz = w1 * rz + w2 * imu_msg->angular_velocity.z;
 
+            // 添加插值后的IMU数据
             imu_meas.emplace_back(
                 current_time, std::make_pair(Eigen::Vector3d(rx, ry, rz), Eigen::Vector3d(dx, dy, dz)));
           }
         }
+        
+        // 尝试使用收集到的IMU数据初始化ESKF滤波器
         eskf_pro->tryInit(imu_meas);
-        imu_meas.clear();
+        imu_meas.clear();  // 清空IMU测量缓存
 
         last_time_frame = time_frame;
 
+        // 释放当前测量数据的内存
         std::vector<point3D>().swap(measurement.lidar_points);
 
         if (measurement.rendering) {
           measurement.image.release();
         }
-        continue;
+        continue;  // 跳过后续处理，继续下一个测量数据
       }
 
+      // === 系统已初始化阶段 ===
       if (initial_flag) {
+        // 创建IMU状态临时变量
         imuState imu_state_temp;
-
         imu_state_temp.timestamp = current_time;
 
+        // 计算去偏后的加速度和角速度
         imu_state_temp.un_acc =
             eskf_pro->getRotation().toRotationMatrix() * (eskf_pro->getLastAcc() - eskf_pro->getBa());
         imu_state_temp.un_gyr = eskf_pro->getLastGyr() - eskf_pro->getBg();
+        
+        // 记录当前状态
         imu_state_temp.trans = eskf_pro->getTranslation();
         imu_state_temp.quat = eskf_pro->getRotation();
         imu_state_temp.vel = eskf_pro->getVelocity();
@@ -2363,20 +2631,25 @@ void lioOptimization::run() {
         imu_states.push_back(imu_state_temp);
       }
 
+      // 计时器：执行状态SLAM处理
       common::Timer::Evaluate(
           gp_options_.log_time,
           ros::Time::now().toSec(),
           [&]() {
+            // 遍历当前测量中的所有IMU数据进行预测更新
             for (auto& imu_msg : measurement.imu_measurements) {
               double time_imu = imu_msg->header.stamp.toSec();
 
+              // 如果IMU时间戳早于或等于图像时间戳
               if (time_imu <= time_frame) {
-                double dt = time_imu - current_time;
+                double dt = time_imu - current_time;  // 计算时间间隔
 
-                if (dt < -1e-6)
+                if (dt < -1e-6)  // 跳过负时间间隔（可能的时钟回退）
                   continue;
                 assert(dt >= 0);
+                
                 current_time = time_imu;
+                // 提取IMU原始数据
                 dx = imu_msg->linear_acceleration.x;
                 dy = imu_msg->linear_acceleration.y;
                 dz = imu_msg->linear_acceleration.z;
@@ -2385,32 +2658,43 @@ void lioOptimization::run() {
                 rz = imu_msg->angular_velocity.z;
 
                 imuState imu_state_temp;
-
                 imu_state_temp.timestamp = current_time;
 
+                // 计算去偏后的加速度（使用当前和上一次测量的平均值）
                 imu_state_temp.un_acc =
                     eskf_pro->getRotation().toRotationMatrix() *
                     (0.5 * (eskf_pro->getLastAcc() + Eigen::Vector3d(dx, dy, dz)) - eskf_pro->getBa());
+                
+                // 计算去偏后的角速度（使用当前和上一次测量的平均值）
                 imu_state_temp.un_gyr =
                     0.5 * (eskf_pro->getLastGyr() + Eigen::Vector3d(rx, ry, rz)) - eskf_pro->getBg();
 
-                dt_sum = dt_sum + dt;
+                dt_sum = dt_sum + dt;  // 累积时间间隔
+                
+                // 使用IMU数据进行ESKF预测步骤
                 eskf_pro->predict(dt, Eigen::Vector3d(dx, dy, dz), Eigen::Vector3d(rx, ry, rz));
 
+                // 更新IMU状态
                 imu_state_temp.trans = eskf_pro->getTranslation();
                 imu_state_temp.quat = eskf_pro->getRotation();
                 imu_state_temp.vel = eskf_pro->getVelocity();
 
                 imu_states.push_back(imu_state_temp);
               } else {
+                // IMU时间戳晚于图像时间戳，需要插值处理
                 double dt_1 = time_frame - current_time;
                 double dt_2 = time_imu - time_frame;
                 current_time = time_frame;
+                
                 assert(dt_1 >= 0);
                 assert(dt_2 >= 0);
                 assert(dt_1 + dt_2 > 0);
+                
+                // 计算插值权重
                 double w1 = dt_2 / (dt_1 + dt_2);
                 double w2 = dt_1 / (dt_1 + dt_2);
+                
+                // 线性插值IMU数据
                 dx = w1 * dx + w2 * imu_msg->linear_acceleration.x;
                 dy = w1 * dy + w2 * imu_msg->linear_acceleration.y;
                 dz = w1 * dz + w2 * imu_msg->linear_acceleration.z;
@@ -2419,9 +2703,9 @@ void lioOptimization::run() {
                 rz = w1 * rz + w2 * imu_msg->angular_velocity.z;
 
                 imuState imu_state_temp;
-
                 imu_state_temp.timestamp = current_time;
 
+                // 计算插值后的去偏加速度和角速度
                 imu_state_temp.un_acc =
                     eskf_pro->getRotation().toRotationMatrix() *
                     (0.5 * (eskf_pro->getLastAcc() + Eigen::Vector3d(dx, dy, dz)) - eskf_pro->getBa());
@@ -2429,6 +2713,8 @@ void lioOptimization::run() {
                     0.5 * (eskf_pro->getLastGyr() + Eigen::Vector3d(rx, ry, rz)) - eskf_pro->getBg();
 
                 dt_sum = dt_sum + dt_1;
+                
+                // 使用插值数据进行预测
                 eskf_pro->predict(dt_1, Eigen::Vector3d(dx, dy, dz), Eigen::Vector3d(rx, ry, rz));
 
                 imu_state_temp.trans = eskf_pro->getTranslation();
@@ -2438,12 +2724,17 @@ void lioOptimization::run() {
                 imu_states.push_back(imu_state_temp);
               }
 
+              // 发布里程计信息到ROS话题
               nav_msgs::Odometry odomAftMapped;
-              odomAftMapped.header.frame_id = "camera_init";
-              odomAftMapped.child_frame_id = "body";
+              odomAftMapped.header.frame_id = "camera_init";  // 参考坐标系
+              odomAftMapped.child_frame_id = "body";          // 载体坐标系
               odomAftMapped.header.stamp = imu_msg->header.stamp;
+              
+              // 获取预测的位置和姿态
               Eigen::Vector3d p_predict = eskf_pro->getTranslation();
               Eigen::Quaterniond q_predict = eskf_pro->getRotation();
+              
+              // 填充里程计消息
               odomAftMapped.pose.pose.orientation.x = q_predict.x();
               odomAftMapped.pose.pose.orientation.y = q_predict.y();
               odomAftMapped.pose.pose.orientation.z = q_predict.z();
@@ -2451,27 +2742,33 @@ void lioOptimization::run() {
               odomAftMapped.pose.pose.position.x = p_predict.x();
               odomAftMapped.pose.pose.position.y = p_predict.y();
               odomAftMapped.pose.pose.position.z = p_predict.z();
+              
+              // 发布里程计数据
               pub_odom.publish(odomAftMapped);
             }
           },
           "stateSLAM");
 
+      // 调用主处理函数，进行点云处理、状态估计和高斯重建
       process(
-          measurement.lidar_points,
-          measurement.time_sweep.first,
-          measurement.time_sweep.second,
-          measurement.image,
-          measurement.rendering);
+          measurement.lidar_points,        // 激光雷达点云数据
+          measurement.time_sweep.first,    // 扫描开始时间
+          measurement.time_sweep.second,   // 扫描持续时间
+          measurement.image,               // 图像数据
+          measurement.rendering);          // 是否需要渲染
 
+      // 清理当前帧的IMU状态数据
       imu_states.clear();
 
+      // 更新时间和帧索引
       last_time_frame = time_frame;
       index_frame++;
 
+      // 释放内存
       std::vector<point3D>().swap(measurement.lidar_points);
 
       if (measurement.rendering) {
-        measurement.image.release();
+        measurement.image.release();  // 释放图像内存
       }
     }
   }

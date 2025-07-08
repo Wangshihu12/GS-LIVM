@@ -106,120 +106,188 @@ void imageProcessing::printParameter() {
   // std::cout << "t_imu_camera: \n" << std::fixed << t_imu_camera.transpose() << std::endl;
 }
 
+/**
+ * 图像处理主函数
+ * 执行视觉惯性里程计(VIO)的完整处理流程，包括图像预处理、特征跟踪、位姿优化等
+ * @param voxel_map 体素哈希地图引用
+ * @param p_frame 当前点云帧指针（包含RGB图像数据）
+ * @return 处理是否成功
+ */
 bool imageProcessing::process(voxelHashMap& voxel_map, cloudFrame* p_frame) {
+  
+  // === 图像尺寸调整 ===
+  // 根据配置的缩放比例调整图像大小，用于控制计算负载
   common::Timer::Evaluate(
       log_time,
       ros::Time::now().toSec(),
       [&]() {
+        // 检查是否需要调整图像尺寸
         if (fabs(image_resize_ratio - 1.0) > 1e-6) {
           cv::Mat temp_img;
+          // 按比例缩放图像
           cv::resize(
-              p_frame->rgb_image,
-              temp_img,
+              p_frame->rgb_image,  // 原始RGB图像
+              temp_img,           // 缩放后的临时图像
               cv::Size(image_width * image_resize_ratio, image_height * image_resize_ratio));
-          p_frame->rgb_image = temp_img;
+          p_frame->rgb_image = temp_img;  // 更新帧中的图像
 
+          // 更新图像的列数和行数
           p_frame->image_cols = (int)image_width * image_resize_ratio;
           p_frame->image_rows = (int)image_height * image_resize_ratio;
         } else {
+          // 如果不需要缩放，直接使用原始尺寸
           p_frame->image_cols = (int)image_width;
           p_frame->image_rows = (int)image_height;
         }
       },
       "resizeImage");
 
-  cv::Mat image_undistort;
+  // === 图像去畸变处理 ===
+  cv::Mat image_undistort;  // 去畸变后的图像
   common::Timer::Evaluate(
       log_time,
       ros::Time::now().toSec(),
-      [&]() { log_time, cv::remap(p_frame->rgb_image, image_undistort, m_ud_map1, m_ud_map2, cv::INTER_LINEAR); },
+      [&]() { 
+        // 使用预计算的映射表对图像进行去畸变
+        // m_ud_map1和m_ud_map2是相机标定时预计算的重映射表
+        cv::remap(p_frame->rgb_image, image_undistort, m_ud_map1, m_ud_map2, cv::INTER_LINEAR); 
+      },
       "remapImage");
+  
+  // 初始化立方插值并生成灰度图像，用于后续的特征跟踪
   p_frame->gray_image = initCubicInterpolation(image_undistort);
 
+  // === 首次数据处理：初始化跟踪器 ===
   if (first_data) {
-    std::vector<cv::Point2f> points_2d_vec_temp;
-    std::vector<rgbPoint*> rgb_points_vec_temp;
+    std::vector<cv::Point2f> points_2d_vec_temp;   // 临时2D点向量
+    std::vector<rgbPoint*> rgb_points_vec_temp;    // 临时RGB点指针向量
+    
+    // 从体素地图中选择用于投影的点
     map_tracker->selectPointsForProjection(
-        voxel_map, p_frame, &rgb_points_vec_temp, &points_2d_vec_temp, track_windows_size * image_resize_ratio, 1);
+        voxel_map, p_frame, &rgb_points_vec_temp, &points_2d_vec_temp, 
+        track_windows_size * image_resize_ratio, 1);
+    
+    // 使用选择的点初始化光流跟踪器
     op_tracker->init(p_frame, rgb_points_vec_temp, points_2d_vec_temp);
 
-    first_data = false;
+    first_data = false;  // 标记首次处理完成
   }
 
-  bool reOfTrack = false;
+  // === 图像特征跟踪 ===
+  bool reOfTrack = false;  // 跟踪结果标志
   common::Timer::Evaluate(
-      log_time, ros::Time::now().toSec(), [&]() { reOfTrack = op_tracker->trackImage(p_frame, -20); }, "trackImage");
+      log_time, 
+      ros::Time::now().toSec(), 
+      [&]() { 
+        // 执行图像跟踪，参数-20可能是跟踪质量阈值
+        reOfTrack = op_tracker->trackImage(p_frame, -20); 
+      }, 
+      "trackImage");
 
+  // 检查跟踪是否成功
   if (!reOfTrack) {
     std::cout << ANSI_COLOR_RED_BOLD << "****** Track Error*****" << ANSI_COLOR_RESET << std::endl;
-    return false;
+    return false;  // 跟踪失败，返回false
   }
 
+  // === 更新相机内参（如果需要估计） ===
   if (ifEstimateCameraIntrinsic) {
-    p_frame->p_state->fx = camera_intrinsic(0, 0);
-    p_frame->p_state->fy = camera_intrinsic(1, 1);
-    p_frame->p_state->cx = camera_intrinsic(0, 2);
-    p_frame->p_state->cy = camera_intrinsic(1, 2);
+    p_frame->p_state->fx = camera_intrinsic(0, 0);  // 焦距x
+    p_frame->p_state->fy = camera_intrinsic(1, 1);  // 焦距y
+    p_frame->p_state->cx = camera_intrinsic(0, 2);  // 主点x
+    p_frame->p_state->cy = camera_intrinsic(1, 2);  // 主点y
   }
 
+  // === 更新相机外参（如果需要估计） ===
   if (ifEstimateExtrinsic) {
-    p_frame->p_state->R_imu_camera = R_imu_camera;
-    p_frame->p_state->t_imu_camera = t_imu_camera;
+    p_frame->p_state->R_imu_camera = R_imu_camera;  // IMU到相机的旋转矩阵
+    p_frame->p_state->t_imu_camera = t_imu_camera;  // IMU到相机的平移向量
   }
 
-  bool enough_points = true;
-  bool reOfRemovedPoints = false;
+  bool enough_points = true;      // 是否有足够的点进行优化
+  bool reOfRemovedPoints = false; // 外点去除结果标志
 
+  // === 使用RANSAC PnP去除外点 ===
   common::Timer::Evaluate(
       log_time,
       ros::Time::now().toSec(),
-      [&]() { reOfRemovedPoints = op_tracker->removeOutlierUsingRansacPnp(p_frame); },
+      [&]() { 
+        // 使用RANSAC算法结合PnP求解去除跟踪中的外点
+        reOfRemovedPoints = op_tracker->removeOutlierUsingRansacPnp(p_frame); 
+      },
       "removeOutlierUsingRansacPnp");
 
+  // 检查外点去除是否成功
   if (!reOfRemovedPoints) {
     enough_points = false;
     std::cout << ANSI_COLOR_RED_BOLD << "****** Remove_outlier_using_ransac_pnp error*****" << ANSI_COLOR_RESET
               << std::endl;
-    return false;
+    return false;  // 外点去除失败，返回false
   }
 
-  bool res_esikf = true, res_photometric = true;
+  bool res_esikf = true, res_photometric = true;  // 优化结果标志
 
-  if (enough_points) {
-    common::Timer::Evaluate(log_time, ros::Time::now().toSec(), [&]() { res_esikf = vioEsikf(p_frame); }, "vioEsikf");
-  }
-
+  // === VIO扩展卡尔曼滤波优化 ===
   if (enough_points) {
     common::Timer::Evaluate(
-        log_time, ros::Time::now().toSec(), [&]() { res_photometric = vioPhotometric(p_frame); }, "vioPhotometric");
+        log_time, 
+        ros::Time::now().toSec(), 
+        [&]() { 
+          // 执行基于扩展卡尔曼滤波的视觉惯性里程计优化
+          res_esikf = vioEsikf(p_frame); 
+        }, 
+        "vioEsikf");
   }
 
+  // === VIO光度优化 ===
+  if (enough_points) {
+    common::Timer::Evaluate(
+        log_time, 
+        ros::Time::now().toSec(), 
+        [&]() { 
+          // 执行基于光度误差的视觉惯性里程计优化
+          res_photometric = vioPhotometric(p_frame); 
+        }, 
+        "vioPhotometric");
+  }
+
+  // === 在最近访问的体素中渲染点 ===
   if (enough_points) {
     common::Timer::Evaluate(
         log_time,
         ros::Time::now().toSec(),
         [&]() {
+          // 在最近访问的体素中渲染3D点到2D图像平面
+          // 用于后续的视觉跟踪和地图更新
           map_tracker->renderPointsInRecentVoxel(
               voxel_map, p_frame, &map_tracker->voxels_recent_visited, p_frame->time_sweep_end);
         },
         "renderPointsInRecentVoxel");
   }
 
+  // === 更新投影位姿和跟踪点 ===
   if (enough_points) {
     common::Timer::Evaluate(
         log_time,
         ros::Time::now().toSec(),
         [&]() {
+          // 更新用于投影的位姿（参数-0.4可能是深度阈值）
           map_tracker->updatePoseForProjection(p_frame, -0.4);
+          
+          // 刷新用于投影的3D点
           map_tracker->refreshPointsForProjection(voxel_map);
+          
+          // 更新并添加新的跟踪点
+          // 参数：跟踪窗口大小、最大点数限制
           op_tracker->updateAndAppendTrackPoints(
               p_frame, map_tracker, track_windows_size * image_resize_ratio, 1000000);
         },
         "vioOthers");
   }
 
+  // 更新上次处理时间
   time_last_process = p_frame->time_sweep_end;
-  return true;
+  return true;  // 处理成功
 }
 
 void imageProcessing::imageEqualize(cv::Mat& image, int amp) {
