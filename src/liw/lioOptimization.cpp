@@ -1729,44 +1729,62 @@ for (int i = 0; i < all_cloud_frame.size(); i++) {
 }
 }
 
+/**
+ * 3D高斯喷溅视觉优化主循环
+ * 这是GS-LIVM系统的核心组件，负责优化3D高斯参数和相机位姿
+ * 使用神经渲染损失和几何一致性损失进行联合优化
+ */
 void lioOptimization::optimize_vis() {
+  // === 初始化计时器 ===
   std::chrono::time_point<std::chrono::high_resolution_clock> cool_start = std::chrono::high_resolution_clock::now();
+  
+  // === 主优化循环 ===
   while (true) {
+    // 短暂休眠，避免CPU过度占用
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    
+    // === 系统状态检查 ===
     if (!is_gs_started) {
-      continue;
+      continue;  // 如果高斯喷溅系统未启动，继续等待
     }
     if (stop_thread) {
-      return;
+      return;    // 如果收到停止信号，退出函数
     }
 
+    // === CUDA可用性检查 ===
     if (!torch::cuda::is_available()) {
-      // At the moment, I want to make sure that my GPU is utilized.
+      // 确保GPU可用，因为高斯喷溅需要大量GPU计算
       std::cout << "CUDA is not available! Training on CPU." << std::endl;
       exit(-1);
     }
 
-    // loop map queue and add new points to the 3d gaussians
+    // === 新高斯点添加到地图 ===
+    // 定期或当累积点数过多时，将新的激光雷达点转换为3D高斯并添加到地图
     if ((new_gs_points_for_map_count != 0 && iter % 5 == 0) || new_gs_points_for_map_count > 1000) {
       if (new_gs_points_for_map_count == 0) {
         continue;
       }
 
+      // 处理并合并点云，添加到高斯地图
       common::Timer::Evaluate(
           gp_options_.log_time,
           ros::Time::now().toSec(),
           [&]() {
-            GSLIVM::GsForMaps all_gs;
-            processAndMergePointClouds(all_gs);
-            gaussian_pro->addNewPointcloud(gsoptimParams, all_gs, iter, 1.f);
+            GSLIVM::GsForMaps all_gs;                                    // 创建高斯地图数据结构
+            processAndMergePointClouds(all_gs);                         // 处理并合并点云数据
+            gaussian_pro->addNewPointcloud(gsoptimParams, all_gs, iter, 1.f); // 将新点云添加到高斯处理器
           },
           "optimize_vis_gsMapUpdate");
     }
 
-    std::vector<std::vector<Camera>> optimized_cams;
-    std::vector<std::vector<Camera>> optimized_cams2;
+    // === 相机选择和采样策略 ===
+    std::vector<std::vector<Camera>> optimized_cams;   // 当前和历史相机
+    std::vector<std::vector<Camera>> optimized_cams2;  // 额外的历史相机（用于深度一致性）
 
     auto camera_size = _cameras.size();
+    
+    // === 等待足够的相机数据 ===
+    // 确保有足够的相机帧进行滑动窗口优化
     if (camera_size <= gp_options_.image_sliding_window * 2 + gp_options_.history_cam_per_iter) {
       std::cout << "<=== wait for enough cameras... "
                 << std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -1776,136 +1794,100 @@ void lioOptimization::optimize_vis() {
       std::this_thread::sleep_for(std::chrono::seconds(1));
       continue;
     }
-    // here
+
+    // === 智能相机采样策略 ===
     {
-      // std::vector<int> numbers(camera_size);
-      // for (int i = 0; i < camera_size; ++i) {
-      //   numbers[i] = i;
-      // }
-
-      // unsigned seed = std::chrono::system_clock::now().time_since_epoch().count();
-
-      // std::shuffle(numbers.begin(), numbers.end(), std::default_random_engine(seed));
-
-      // auto curr_before = findAndErase(numbers, selected_indices_hist);
-
-      // if (curr_before.empty()) {
-      //   selected_indices_hist.clear();
-      //   std::cout << "<=== optimize whole history image scequence again... " << std::endl;
-      //   continue;
-      // }
-
-      // auto cams = _cameras[curr_before[0]];
-      // std::cout << curr_before[0] << std::endl;
-      // optimized_cams.push_back(cams);
-      // for (int ii = 335; ii < 340; ++ii) {
-      //   if (ii >= camera_size - 10) {
-      //     continue;
-      //   }
-
-      //   auto cams = _cameras[ii];
-      //   optimized_cams.push_back(cams);
-      // }
-
-      // selected_indices_hist.push_back(curr_before[0]);
-    }
-    {
+      // 从可用相机中随机选择当前帧和历史帧进行优化
       auto [curr_indices, curr_before] = get_random_indices(
-          camera_size,
-          selected_indices_curr,
-          selected_indices_hist,
-          gp_options_.image_sliding_window,
-          gp_options_.curr_cam_per_iter,
-          gp_options_.history_cam_per_iter);
+          camera_size,                              // 总相机数量
+          selected_indices_curr,                    // 已选择的当前帧索引
+          selected_indices_hist,                    // 已选择的历史帧索引
+          gp_options_.image_sliding_window,         // 滑动窗口大小
+          gp_options_.curr_cam_per_iter,           // 每次迭代的当前帧数
+          gp_options_.history_cam_per_iter);       // 每次迭代的历史帧数
 
+      // 过滤已经处理过的索引
       curr_indices = findAndErase(curr_indices, selected_indices_curr);
       curr_before = findAndErase(curr_before, selected_indices_hist);
 
+      // === 处理采样结果 ===
+      // 如果当前帧用完，重新开始
       if (curr_indices.empty() && gp_options_.image_sliding_window != 0) {
         selected_indices_curr.clear();
-        std::cout << "<=== optimize whole current image scequence again... " << std::endl;
+        std::cout << "<=== optimize whole current image sequence again... " << std::endl;
         continue;
       }
 
+      // 如果历史帧用完，重新开始
       if (curr_before.empty()) {
         selected_indices_hist.clear();
-        std::cout << "<=== optimize whole history image scequence again... " << std::endl;
+        std::cout << "<=== optimize whole history image sequence again... " << std::endl;
         continue;
       }
 
+      // === 构建优化相机列表 ===
       common::Timer::Evaluate(
           gp_options_.log_time,
           ros::Time::now().toSec(),
           [&]() {
-            // current
-            // std::cout << "optimized camera: ";
-            // for (int camera_index = curr_indices.size() - 1;
-            //      camera_index >= std::max((int)curr_indices.size() - gp_options_.curr_cam_per_iter, 0);
-            //      camera_index--) {
-
+            // === 添加当前帧相机 ===
             int cccount_curr = 0;
             for (auto camera_index : curr_indices) {
               if (cccount_curr >= gp_options_.curr_cam_per_iter) {
                 break;
               }
-              // first
-              selected_indices_curr.push_back(camera_index);
-
-              auto cams = _cameras[camera_index];
-              optimized_cams.push_back(cams);
-              // std::cout << camera_index << " ";
-              // second
-              // auto cams_ref = _cameras[camera_index + 1];
-              // optimized_cams.push_back(cams_ref);
+              
+              selected_indices_curr.push_back(camera_index);  // 记录已选择的索引
+              auto cams = _cameras[camera_index];             // 获取相机数据
+              optimized_cams.push_back(cams);                 // 添加到优化列表
               cccount_curr++;
             }
 
-            // history
+            // === 添加历史帧相机 ===
             int cccount_hist = 0;
-
-            // std::cout << camera_size << " camera_size " << std::endl;
             for (auto camera_index : curr_before) {
               if (cccount_hist >= gp_options_.history_cam_per_iter) {
                 break;
               }
 
-              // first
-              selected_indices_hist.push_back(camera_index);
-
+              selected_indices_hist.push_back(camera_index);  // 记录历史帧索引
+              
+              // 添加主相机
               auto cams = _cameras[camera_index];
               optimized_cams.push_back(cams);
 
-              // second
+              // 添加参考相机（用于深度一致性计算）
               auto cams_ref = _cameras[camera_index + 1];
               optimized_cams.push_back(cams_ref);
               cccount_hist++;
 
-              // std::cout << camera_index << " outer " << std::endl;
+              // === 添加特定范围的额外相机（调试用） ===
               for (int ii = 326; ii < 329; ++ii) {
                 if (ii >= camera_size) {
                   continue;
                 }
-
-                // std::cout << ii << " inter " << _cameras.size() << std::endl;
                 auto cams = _cameras[ii];
                 optimized_cams2.push_back(cams);
               }
             }
-            // std::cout << std::endl;
           },
           "optimize_vis_getCameraIndex");
     }
 
-    std::vector<torch::Tensor> losses;
+    // === 损失计算准备 ===
+    std::vector<torch::Tensor> losses;  // 存储所有损失项
 
+    // === 相似性损失计算 ===
     GSLIVM::GsForLosses all_gs_loss;
-    // for similarity loss
+    
+    // 处理并合并用于相似性损失的数据
     common::Timer::Evaluate(
         gp_options_.log_time,
         ros::Time::now().toSec(),
         [&]() { processAndMergeLosses(all_gs_loss); },
         "optimize_vis_merge simi points");
 
+    // 计算基于深度相似性的损失
     torch::Tensor simi_loss = torch::zeros({});
     common::Timer::Evaluate(
         gp_options_.log_time,
@@ -1914,24 +1896,27 @@ void lioOptimization::optimize_vis() {
           if (all_gs_loss._losses.size() != 0) {
             bool re = gaussian_pro->calcSimiLoss(all_gs_loss, simi_loss, gsoptimParams.lambda_depth_simi);
             if (re) {
-              losses.push_back(simi_loss);
+              losses.push_back(simi_loss);  // 将相似性损失添加到损失列表
             }
           }
         },
         "optimize_vis_calc simi loss");
 
+    // === 主要的渲染和损失计算 ===
     common::Timer::Evaluate(
         gp_options_.log_time,
         ros::Time::now().toSec(),
         [&]() {
           int cam_index = 0;
+          std::vector<GSLIVM::DeltaSimi> delta_infos;  // 存储深度一致性计算所需信息
 
-          std::vector<GSLIVM::DeltaSimi> delta_infos;
-
+          // === 处理额外历史相机（深度一致性用） ===
           for (auto& cam : optimized_cams2) {
-            // Render
+            // 渲染图像和深度
             auto [image, depth, depth_sol] = render(cam[0], gaussian_pro, background);
             torch::Tensor gt_image = cam[0].Get_original_image().to(torch::kCUDA, true);
+            
+            // 存储深度一致性计算所需信息
             GSLIVM::DeltaSimi _delta;
             _delta.cam_pose_R = cam[0].Get_R();
             _delta.cam_pose_t = cam[0].Get_T();
@@ -1941,21 +1926,22 @@ void lioOptimization::optimize_vis() {
             _delta.depth_sol = depth_sol;
             delta_infos.push_back(_delta);
 
-            // Loss Computations
-            auto l1l = gaussian_splatting::l1_loss(image, gt_image);
-
-            // render this image
-            auto ssim_loss = gaussian_splatting::ssim(image, gt_image, conv_window, window_size, channel);
-
+            // === 计算图像重建损失 ===
+            auto l1l = gaussian_splatting::l1_loss(image, gt_image);              // L1损失
+            auto ssim_loss = gaussian_splatting::ssim(image, gt_image, conv_window, window_size, channel); // SSIM损失
+            
+            // 组合损失：L1 + SSIM
             auto image_loss = (1.f - gsoptimParams.lambda_dssim) * l1l + gsoptimParams.lambda_dssim * (1.f - ssim_loss);
-
             losses.push_back(image_loss);
           }
 
+          // === 处理主要优化相机 ===
           for (auto& cam : optimized_cams) {
-            // Render
+            // 渲染当前视角
             auto [image, depth, depth_sol] = render(cam[0], gaussian_pro, background);
             torch::Tensor gt_image = cam[0].Get_original_image().to(torch::kCUDA, true);
+            
+            // 存储深度信息用于一致性检查
             GSLIVM::DeltaSimi _delta;
             _delta.cam_pose_R = cam[0].Get_R();
             _delta.cam_pose_t = cam[0].Get_T();
@@ -1965,34 +1951,31 @@ void lioOptimization::optimize_vis() {
             _delta.depth_sol = depth_sol;
             delta_infos.push_back(_delta);
 
-            // Loss Computations
+            // === 计算渲染损失 ===
             auto l1l = gaussian_splatting::l1_loss(image, gt_image);
-
-            // render this image
             auto ssim_loss = gaussian_splatting::ssim(image, gt_image, conv_window, window_size, channel);
-
             auto image_loss = (1.f - gsoptimParams.lambda_dssim) * l1l + gsoptimParams.lambda_dssim * (1.f - ssim_loss);
-
             losses.push_back(image_loss);
 
-            // Update status line
+            // === 定期状态输出和图像保存 ===
             if (iter % 50 == 0 && cam_index == 0) {
+              // 计算评估指标
               auto psnr_loss = gaussian_splatting::psnr(image, gt_image);
               float psnr_value = psnr_loss.item<float>();
               float ssim_value = ssim_loss.item<float>();
 
+              // 保存对比图像
               auto render_image = tensor2CvMat3X(image);
               auto gt_imagexx = tensor2CvMat3X(gt_image);
-
               cv::Mat mergedImage;
               cv::hconcat(render_image, gt_imagexx, mergedImage);
 
               std::string imagePath = gsmodelParams.output_path.string() + "/training/" + cam[0].Get_image_name();
-
               if (!std::filesystem::exists(imagePath)) {
                 cv::imwrite(imagePath, mergedImage);
               }
 
+              // === 输出详细状态信息 ===
               std::stringstream status_line;
               status_line.imbue(std::locale(""));
               status_line << "\rIter: " << std::setw(6) << iter;
@@ -2006,6 +1989,8 @@ void lioOptimization::optimize_vis() {
               status_line << "  Splats: " << std::setw(10) << (int)gaussian_pro->Get_xyz().size(0);
               status_line << "  PSNR: " << std::setw(10) << (float)psnr_value;
               status_line << "  SSIM: " << std::setw(10) << (float)ssim_value;
+              
+              // 格式化输出
               const int curlen = status_line.str().length();
               const int ws = last_status_len - curlen;
               if (ws > 0) {
@@ -2017,72 +2002,85 @@ void lioOptimization::optimize_vis() {
             cam_index++;
           }
 
+          // === 深度一致性损失计算 ===
+          // 对于历史帧的相机对，计算深度一致性损失
           for (int tmp_i = gp_options_.curr_cam_per_iter; tmp_i < optimized_cams.size(); tmp_i += 2) {
+            // 计算从源视角重投影到参考视角的深度
             auto renderedimage = gaussian_pro->calcDeltaSimi(delta_infos[tmp_i], delta_infos[tmp_i + 1]);
 
+            // 转换为逆深度用于比较
             auto inv_renderedimage = gaussian_splatting::inv_depth(renderedimage);
             auto inv_ref_depth = gaussian_splatting::inv_depth(delta_infos[tmp_i + 1].depth);
 
+            // === 创建有效深度掩码 ===
+            // 源图像掩码：过滤无效深度值
             auto mask_src = torch::ones_like(delta_infos[tmp_i].depth_sol, torch::kCUDA);
             auto mask_condition = delta_infos[tmp_i].depth_sol < 0.5;
             mask_src.masked_fill_(mask_condition, 0);
 
+            // 参考图像掩码
             auto mask_ref = torch::ones_like(delta_infos[tmp_i + 1].depth_sol, torch::kCUDA);
             auto mask_condition_ref = delta_infos[tmp_i + 1].depth_sol < 0.5;
             mask_ref.masked_fill_(mask_condition_ref, 0);
 
+            // === 计算掩码后的深度差异 ===
             auto rendered_image_mask = inv_renderedimage * mask_src * mask_ref;
             auto rendered_ref_image_mask = inv_ref_depth * mask_ref * mask_src;
 
+            // 计算深度差异
             auto gap = torch::abs((rendered_image_mask - rendered_ref_image_mask));
 
+            // 深度一致性损失
             auto delta_simi_loss = gsoptimParams.lambda_delta_depth_simi * gap.mean();
-
             losses.push_back(delta_simi_loss);
+
+            // === 定期保存深度图像用于调试 ===
             if (iter % 200 == 0 || delta_simi_loss.item<float>() > 0.5) {
               auto rep_image = tensor2CvMat2X(renderedimage);
               auto ref_image = tensor2CvMat2X(delta_infos[tmp_i + 1].depth);
               cv::Mat mergeddepthImage;
               cv::hconcat(rep_image, ref_image, mergeddepthImage);
               cv::imwrite(gsmodelParams.output_path.string() + "/training/latest_depth.jpg", mergeddepthImage);
-
-              // saveDepthMapAsNPY(
-              //     delta_infos[tmp_i + 1].depth_sol, gsmodelParams.output_path.string() + "/training/latest_sol.npy");
-              // torch::Tensor merged_depth = torch::cat({rendered_image_mask, rendered_ref_image_mask}, 1);
-              // saveDepthMapAsNPY(merged_depth, gsmodelParams.output_path.string() + "/training/latest_depth.npy");
             }
           }
         },
         "GS_Render_verbose");
 
+    // === 反向传播和优化器步骤 ===
     common::Timer::Evaluate(
         gp_options_.log_time,
         ros::Time::now().toSec(),
         [&]() {
+          // 合并所有损失项
           torch::Tensor loss = torch::zeros({}).to(torch::kCUDA);
           for (auto& los : losses) {
             loss += los;
           }
+          
+          // 如果有损失，执行反向传播
           if (losses.size() != 0) {
             loss.backward();
           }
 
-          //  Optimizer step
+          // 执行优化器步骤
           gaussian_pro->_optimizer->step();
           gaussian_pro->_optimizer->zero_grad(true);
         },
         "Backward_Step_verbose");
 
+    // === GPU内存管理 ===
     common::Timer::Evaluate(
         gp_options_.log_time,
         ros::Time::now().toSec(),
         [&]() {
+          // 定期清空GPU缓存，防止内存泄漏
           if (gsoptimParams.empty_gpu_cache && iter % gsoptimParams.empty_iterations == 0) {
             c10::cuda::CUDACachingAllocator::emptyCache();
           }
         },
         "optimize_vis_emptyGPUCache");
-    iter++;
+    
+    iter++;  // 增加迭代计数器
   }
 }
 

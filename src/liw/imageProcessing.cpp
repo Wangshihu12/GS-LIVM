@@ -335,51 +335,69 @@ double getHuberLoss(double residual, double outlier_threshold = 1.0) {
 
 const int minimum_iteration_points = 10;
 
+/**
+ * 视觉惯性里程计扩展卡尔曼滤波优化函数
+ * 使用2D-3D点对应关系优化相机的位姿、外参和内参
+ * @param p_frame 当前点云帧指针
+ * @return 优化是否成功
+ */
 bool imageProcessing::vioEsikf(cloudFrame* p_frame) {
   scope_color(ANSI_COLOR_BLUE_BOLD);
 
-  Eigen::Matrix<double, -1, -1> H_mat;
-  Eigen::Matrix<double, 11, 1> solution;
-  Eigen::Matrix<double, -1, 1> residual_vec;
-  Eigen::Matrix<double, 11, 1> HTr;
-  Eigen::Matrix<double, 11, 11> HTH;
+  // === 声明优化所需的矩阵和向量 ===
+  Eigen::Matrix<double, -1, -1> H_mat;         // 雅可比矩阵（观测方程的线性化）
+  Eigen::Matrix<double, 11, 1> solution;       // 优化解向量（状态增量）
+  Eigen::Matrix<double, -1, 1> residual_vec;   // 残差向量（重投影误差）
+  Eigen::Matrix<double, 11, 1> HTr;            // H^T * residual
+  Eigen::Matrix<double, 11, 11> HTH;           // H^T * H
 
-  Eigen::Matrix<double, 11, -1> K;
-  Eigen::Matrix<double, 11, 1> d_x;
+  Eigen::Matrix<double, 11, -1> K;             // 卡尔曼增益矩阵
+  Eigen::Matrix<double, 11, 1> d_x;            // 状态变量相对于预测值的偏差
 
+  // === 获取跟踪点数量并检查 ===
   int total_point_size = op_tracker->map_rgb_points_in_cur_image_pose.size();
 
+  // 如果跟踪点太少，无法进行可靠的优化
   if (total_point_size < minimum_iteration_points) {
     return false;
   }
 
-  H_mat.resize(total_point_size * 2, 11);
-  residual_vec.resize(total_point_size * 2, 1);
+  // === 动态分配矩阵大小 ===
+  // 每个点贡献2个残差（u和v方向），状态向量维度为11
+  H_mat.resize(total_point_size * 2, 11);      // 雅可比矩阵：2n × 11
+  residual_vec.resize(total_point_size * 2, 1); // 残差向量：2n × 1
 
-  K.resize(11, total_point_size * 2);
+  K.resize(11, total_point_size * 2);          // 卡尔曼增益：11 × 2n
 
-  double t_predict = p_frame->p_state->time_td;
-  Eigen::Vector3d p_predict = p_frame->p_state->t_imu_camera;
-  Eigen::Quaterniond q_predict = Eigen::Quaterniond(p_frame->p_state->R_imu_camera);
-  double fx_predict = p_frame->p_state->fx;
-  double fy_predict = p_frame->p_state->fy;
-  double cx_predict = p_frame->p_state->cx;
-  double cy_predict = p_frame->p_state->cy;
+  // === 获取当前状态的预测值（作为线性化点） ===
+  double t_predict = p_frame->p_state->time_td;              // 时间偏移预测值
+  Eigen::Vector3d p_predict = p_frame->p_state->t_imu_camera; // IMU到相机平移预测值
+  Eigen::Quaterniond q_predict = Eigen::Quaterniond(p_frame->p_state->R_imu_camera); // IMU到相机旋转预测值
+  double fx_predict = p_frame->p_state->fx;                  // 焦距x预测值
+  double fy_predict = p_frame->p_state->fy;                  // 焦距y预测值
+  double cx_predict = p_frame->p_state->cx;                  // 主点x预测值
+  double cy_predict = p_frame->p_state->cy;                  // 主点y预测值
 
-  int num_used_point_count = 0;
+  int num_used_point_count = 0;  // 实际使用的点数计数器
 
-  double acc_residual = 0;
-  double last_acc_residual = 3e8;
+  // === 初始化残差相关变量 ===
+  double acc_residual = 0;        // 当前迭代的累积残差
+  double last_acc_residual = 3e8; // 上一次迭代的累积残差（用于收敛判断）
 
+  // === 计算相机测量权重 ===
+  // 根据新访问体素数量自适应调整权重，新体素越多权重越小
   cam_measurement_weight = std::max(0.001, std::min(5.0 / map_tracker->number_of_new_visited_voxel, 0.01));
 
+  // === 迭代优化循环 ===
   for (int iter_count = 0; iter_count < num_iterations; iter_count++) {
-    int point_idx = -1;
-    acc_residual = 0;
+    int point_idx = -1;      // 点索引计数器
+    acc_residual = 0;        // 重置累积残差
 
-    Eigen::Vector3d point_world, point_camera;
-    Eigen::Vector2d pixel_match, pixel_projection, pixel_velocity;
+    // 声明点处理相关变量
+    Eigen::Vector3d point_world, point_camera;           // 3D点的世界坐标和相机坐标
+    Eigen::Vector2d pixel_match, pixel_projection, pixel_velocity; // 2D像素：匹配点、投影点、速度
 
+    // === 初始化本次迭代的矩阵 ===
     H_mat.setZero();
     solution.setZero();
     residual_vec.setZero();
@@ -387,95 +405,129 @@ bool imageProcessing::vioEsikf(cloudFrame* p_frame) {
     K.setZero();
     d_x.setZero();
 
-    double d_t = p_frame->p_state->time_td - t_predict;
-    Eigen::Vector3d d_p = p_frame->p_state->t_imu_camera - p_predict;
-    Eigen::Quaterniond d_q = q_predict.inverse() * Eigen::Quaterniond(p_frame->p_state->R_imu_camera);
-    Eigen::Vector3d d_so3 = numType::quatToSo3(d_q);
-    double d_fx = p_frame->p_state->fx - fx_predict;
-    double d_fy = p_frame->p_state->fy - fy_predict;
-    double d_cx = p_frame->p_state->cx - cx_predict;
-    double d_cy = p_frame->p_state->cy - cy_predict;
+    // === 计算当前状态相对于预测值的偏差 ===
+    double d_t = p_frame->p_state->time_td - t_predict;                                    // 时间偏移偏差
+    Eigen::Vector3d d_p = p_frame->p_state->t_imu_camera - p_predict;                     // 平移偏差
+    Eigen::Quaterniond d_q = q_predict.inverse() * Eigen::Quaterniond(p_frame->p_state->R_imu_camera); // 旋转偏差
+    Eigen::Vector3d d_so3 = numType::quatToSo3(d_q);                                      // 旋转偏差的so(3)表示
+    double d_fx = p_frame->p_state->fx - fx_predict;                                       // 焦距x偏差
+    double d_fy = p_frame->p_state->fy - fy_predict;                                       // 焦距y偏差
+    double d_cx = p_frame->p_state->cx - cx_predict;                                       // 主点x偏差
+    double d_cy = p_frame->p_state->cy - cy_predict;                                       // 主点y偏差
 
-    d_x(0) = d_t;
-    d_x.segment<3>(1) = d_so3;
-    d_x.segment<3>(4) = d_p;
-    d_x(7) = d_fx;
-    d_x(8) = d_fy;
-    d_x(9) = d_cx;
-    d_x(10) = d_cy;
+    // === 组装状态偏差向量 d_x ===
+    // 状态向量：[td, so3(3), t_ic(3), fx, fy, cx, cy] = 11维
+    d_x(0) = d_t;                    // 时间偏移
+    d_x.segment<3>(1) = d_so3;       // 旋转（so3表示）
+    d_x.segment<3>(4) = d_p;         // 平移
+    d_x(7) = d_fx;                   // 焦距x
+    d_x(8) = d_fy;                   // 焦距y
+    d_x(9) = d_cx;                   // 主点x
+    d_x(10) = d_cy;                  // 主点y
 
     num_used_point_count = 0;
 
+    // === 遍历所有跟踪点构建观测方程 ===
     for (auto it = op_tracker->map_rgb_points_in_last_image_pose.begin();
          it != op_tracker->map_rgb_points_in_last_image_pose.end();
          it++) {
-      point_world = ((rgbPoint*)it->first)->getPosition();
-      pixel_velocity = ((rgbPoint*)it->first)->image_velocity;
-      pixel_match = Eigen::Vector2d(it->second.x, it->second.y);
+      
+      // === 获取点的信息 ===
+      point_world = ((rgbPoint*)it->first)->getPosition();    // 3D点世界坐标
+      pixel_velocity = ((rgbPoint*)it->first)->image_velocity; // 图像平面速度
+      pixel_match = Eigen::Vector2d(it->second.x, it->second.y); // 匹配的2D像素位置
 
-      point_camera =
-          p_frame->p_state->q_camera_world.toRotationMatrix() * point_world + p_frame->p_state->t_camera_world;
+      // === 计算3D点在相机坐标系下的位置 ===
+      point_camera = p_frame->p_state->q_camera_world.toRotationMatrix() * point_world + 
+                     p_frame->p_state->t_camera_world;
+
+      // === 计算投影到图像平面的像素位置（包含运动补偿） ===
       pixel_projection = Eigen::Vector2d(
                              p_frame->p_state->fx * point_camera(0) / point_camera(2) + p_frame->p_state->cx,
                              p_frame->p_state->fy * point_camera(1) / point_camera(2) + p_frame->p_state->cy) +
                          p_frame->p_state->time_td * pixel_velocity;
 
+      // === 计算重投影残差和Huber损失 ===
       double residual = (pixel_projection - pixel_match).norm();
-      double huber_loss = getHuberLoss(residual);
+      double huber_loss = getHuberLoss(residual);  // Huber损失函数，减少外点影响
 
       point_idx++;
       acc_residual += residual;
 
+      // 将加权残差存入残差向量
       residual_vec.block<2, 1>(point_idx * 2, 0) = (pixel_projection - pixel_match) * huber_loss;
 
       num_used_point_count++;
 
+      // === 计算雅可比矩阵 ===
+      
+      // 像素坐标对相机坐标的雅可比：∂u/∂p_c
       Eigen::Matrix<double, 2, 3, Eigen::RowMajor> J_u_pc;
-
       J_u_pc << p_frame->p_state->fx / point_camera.z(), 0,
-          -(p_frame->p_state->fx * point_camera.x()) / (point_camera.z() * point_camera.z()), 0,
-          p_frame->p_state->fy / point_camera.z(),
+          -(p_frame->p_state->fx * point_camera.x()) / (point_camera.z() * point_camera.z()), 
+          0, p_frame->p_state->fy / point_camera.z(),
           -(p_frame->p_state->fy * point_camera.y()) / (point_camera.z() * point_camera.z());
 
+      // 像素坐标对相机内参的雅可比：∂u/∂K
       Eigen::Matrix<double, 2, 4, Eigen::RowMajor> J_u_K;
+      J_u_K << point_camera.x() / point_camera.z(), 0, 1, 0, 
+               0, point_camera.y() / point_camera.z(), 0, 1;
 
-      J_u_K << point_camera.x() / point_camera.z(), 0, 1, 0, 0, point_camera.y() / point_camera.z(), 0, 1;
-
+      // === 填充雅可比矩阵 H_mat ===
+      
+      // 对时间偏移的雅可比（运动补偿项）
       H_mat.block<2, 1>(point_idx * 2, 0) = pixel_velocity * huber_loss;
 
+      // 如果估计外参，计算对旋转和平移的雅可比
       if (ifEstimateExtrinsic) {
+        // 对旋转的雅可比：∂u/∂δθ = ∂u/∂p_c * ∂p_c/∂δθ
         H_mat.block<2, 3>(point_idx * 2, 1) = J_u_pc * numType::skewSymmetric(point_camera) * huber_loss;
+        // 对平移的雅可比：∂u/∂t = -∂u/∂p_c * R^T
         H_mat.block<2, 3>(point_idx * 2, 4) = -J_u_pc * p_frame->p_state->R_imu_camera.transpose() * huber_loss;
       }
 
+      // 如果估计内参，计算对相机内参的雅可比
       if (ifEstimateCameraIntrinsic) {
         H_mat.block<2, 4>(point_idx * 2, 7) = J_u_K * huber_loss;
       }
     }
 
+    // === 计算平均残差 ===
     acc_residual /= total_point_size;
 
+    // 如果可用点数太少，退出迭代
     if (num_used_point_count < minimum_iteration_points) {
       break;
     }
 
+    // === 扩展卡尔曼滤波更新 ===
+    
+    // 构建雅可比矩阵J（考虑SO(3)流形结构）
     Eigen::Matrix<double, 11, 11> J_zero = Eigen::MatrixXd::Identity(11, 11);
+    // 对于SO(3)旋转，使用左雅可比近似：J ≈ I - 0.5 * [δθ]×
     J_zero.block<3, 3>(1, 1) = Eigen::Matrix3d::Identity() - 0.5 * numType::skewSymmetric(d_x.segment<3>(1));
 
+    // 计算卡尔曼增益：K = (H^T*H + (J*P*J^T * weight)^{-1})^{-1} * H^T
     K = (H_mat.transpose() * H_mat + (J_zero * covariance * J_zero.transpose() * cam_measurement_weight).inverse())
             .inverse() *
         H_mat.transpose();
+    
+    // 计算状态更新：δx = -K*r - (I-K*H)*J*d_x
     solution = -K * residual_vec - (Eigen::Matrix<double, 11, 11>::Identity() - K * H_mat) * J_zero * d_x;
 
+    // === 更新相机参数 ===
     updateCameraParameters(p_frame, solution);
 
+    // === 收敛性检查 ===
     if (fabs(acc_residual - last_acc_residual) < 0.01) {
-      break;
+      break;  // 残差变化小于阈值，认为收敛
     }
 
     last_acc_residual = acc_residual;
   }
 
+  // === 更新协方差矩阵 ===
+  // 使用Joseph形式保证数值稳定性：P = J*(I-K*H)*P*J^T
   Eigen::Matrix<double, 11, 11> J_k = Eigen::MatrixXd::Identity(11, 11);
   J_k.block<3, 3>(1, 1) = Eigen::Matrix3d::Identity() - 0.5 * numType::skewSymmetric(solution.segment<3>(1));
 
@@ -484,67 +536,114 @@ bool imageProcessing::vioEsikf(cloudFrame* p_frame) {
   return true;
 }
 
+/**
+ * 更新相机参数函数
+ * 根据优化求解得到的状态增量，更新相机的内参、外参以及相关的位姿变换
+ * @param p_frame 当前点云帧指针
+ * @param d_x 状态增量向量（11维）：[td, so3(3), t_ic(3), fx, fy, cx, cy]
+ */
 void imageProcessing::updateCameraParameters(cloudFrame* p_frame, Eigen::Matrix<double, 11, 1>& d_x) {
+  
+  // === 更新时间偏移参数 ===
+  // 时间偏移td表示图像时间戳与IMU时间戳之间的偏差
   p_frame->p_state->time_td += d_x(0);
 
+  // === 更新IMU到相机的旋转外参 ===
+  // 获取当前的IMU到相机旋转四元数
   Eigen::Quaterniond q_imu_camera = Eigen::Quaterniond(p_frame->p_state->R_imu_camera);
+  
+  // 在SO(3)流形上进行旋转更新
+  // 1. 将so(3)增量转换为四元数：exp(δθ) ≈ I + [δθ]×/2 对于小角度
+  // 2. 右乘更新：q_new = q_old * exp(δθ)
+  // 3. 归一化保证四元数的单位性质
   q_imu_camera = (q_imu_camera * numType::so3ToQuat(d_x.segment<3>(1))).normalized();
 
+  // 将更新后的四元数转换回旋转矩阵存储
   p_frame->p_state->R_imu_camera = q_imu_camera.toRotationMatrix();
+  
+  // === 更新IMU到相机的平移外参 ===
+  // 平移在欧几里得空间中，直接进行向量加法更新
   p_frame->p_state->t_imu_camera += d_x.segment<3>(4);
-  p_frame->p_state->fx += d_x(7);
-  p_frame->p_state->fy += d_x(8);
-  p_frame->p_state->cx += d_x(9);
-  p_frame->p_state->cy += d_x(10);
+  
+  // === 更新相机内参 ===
+  p_frame->p_state->fx += d_x(7);   // 焦距x方向增量
+  p_frame->p_state->fy += d_x(8);   // 焦距y方向增量
+  p_frame->p_state->cx += d_x(9);   // 主点x坐标增量
+  p_frame->p_state->cy += d_x(10);  // 主点y坐标增量
 
+  // === 计算世界到相机的复合变换 ===
+  // 变换链：World → IMU → Camera
+  // 旋转复合：R_world_camera = R_world_imu * R_imu_camera
   p_frame->p_state->q_world_camera =
       Eigen::Quaterniond(p_frame->p_state->rotation.toRotationMatrix() * p_frame->p_state->R_imu_camera);
+  
+  // 平移复合：t_world_camera = R_world_imu * t_imu_camera + t_world_imu
   p_frame->p_state->t_world_camera =
       p_frame->p_state->rotation.toRotationMatrix() * p_frame->p_state->t_imu_camera + p_frame->p_state->translation;
 
+  // === 刷新投影相关的缓存变量 ===
+  // 更新相机到世界的逆变换等投影计算所需的缓存数据
   p_frame->refreshPoseForProjection();
 }
 
+/**
+ * 视觉惯性里程计光度优化函数
+ * 使用RGB颜色信息优化相机外参（IMU到相机的旋转和平移）
+ * @param p_frame 当前点云帧指针
+ * @return 优化是否成功
+ */
 bool imageProcessing::vioPhotometric(cloudFrame* p_frame) {
-  Eigen::Matrix<double, -1, -1> H_mat, R_mat_inv, sqrt_info;
-  Eigen::Matrix<double, 6, 1> solution;
-  Eigen::Matrix<double, -1, 1> residual_vec;
-  Eigen::Matrix<double, 6, 1> HTr;
-  Eigen::Matrix<double, 6, 6> HTH;
+  // === 声明优化所需的矩阵和向量 ===
+  Eigen::Matrix<double, -1, -1> H_mat, R_mat_inv, sqrt_info; // 雅可比矩阵、信息矩阵、平方根信息矩阵
+  Eigen::Matrix<double, 6, 1> solution;                      // 优化解向量（6维：3D旋转+3D平移）
+  Eigen::Matrix<double, -1, 1> residual_vec;                 // 残差向量（RGB颜色差异）
+  Eigen::Matrix<double, 6, 1> HTr;                           // H^T * residual
+  Eigen::Matrix<double, 6, 6> HTH;                           // H^T * H
 
-  Eigen::Matrix<double, 6, -1> K;
-  Eigen::Matrix<double, 6, 1> d_x;
+  Eigen::Matrix<double, 6, -1> K;                            // 卡尔曼增益矩阵
+  Eigen::Matrix<double, 6, 1> d_x;                           // 状态变量相对于预测值的偏差
 
+  // === 获取跟踪点数量并检查 ===
   int total_point_size = op_tracker->map_rgb_points_in_cur_image_pose.size();
 
+  // 如果跟踪点太少，无法进行可靠的优化
   if (total_point_size < minimum_iteration_points) {
     return false;
   }
 
-  H_mat.resize(total_point_size * 3, 6);
-  residual_vec.resize(total_point_size * 3, 1);
-  R_mat_inv.resize(total_point_size * 3, total_point_size * 3);
-  sqrt_info.resize(total_point_size * 3, total_point_size * 3);
+  // === 动态分配矩阵大小 ===
+  // 每个点贡献3个残差（R、G、B），状态向量维度为6（外参：3D旋转+3D平移）
+  H_mat.resize(total_point_size * 3, 6);        // 雅可比矩阵：3n × 6
+  residual_vec.resize(total_point_size * 3, 1); // 残差向量：3n × 1
+  R_mat_inv.resize(total_point_size * 3, total_point_size * 3); // 信息矩阵：3n × 3n
+  sqrt_info.resize(total_point_size * 3, total_point_size * 3); // 平方根信息矩阵：3n × 3n
 
-  K.resize(6, total_point_size * 3);
+  K.resize(6, total_point_size * 3);            // 卡尔曼增益：6 × 3n
 
-  Eigen::Vector3d p_predict = p_frame->p_state->t_imu_camera;
-  Eigen::Quaterniond q_predict = Eigen::Quaterniond(p_frame->p_state->R_imu_camera);
+  // === 获取外参的预测值（作为线性化点） ===
+  Eigen::Vector3d p_predict = p_frame->p_state->t_imu_camera;              // IMU到相机平移预测值
+  Eigen::Quaterniond q_predict = Eigen::Quaterniond(p_frame->p_state->R_imu_camera); // IMU到相机旋转预测值
 
-  int num_used_point_count = 0;
+  int num_used_point_count = 0;  // 实际使用的点数计数器
 
-  double acc_residual = 0;
-  double last_acc_residual = 3e8;
+  // === 初始化残差相关变量 ===
+  double acc_residual = 0;        // 当前迭代的累积残差
+  double last_acc_residual = 3e8; // 上一次迭代的累积残差（用于收敛判断）
 
+  // === 计算相机测量权重 ===
+  // 根据新访问体素数量自适应调整权重
   cam_measurement_weight = std::max(0.001, std::min(5.0 / map_tracker->number_of_new_visited_voxel, 0.01));
 
+  // === 迭代优化循环 ===
   for (int iter_count = 0; iter_count < num_iterations; iter_count++) {
-    int point_idx = -1;
-    acc_residual = 0;
+    int point_idx = -1;      // 点索引计数器
+    acc_residual = 0;        // 重置累积残差
 
-    Eigen::Vector3d point_world, point_camera;
-    Eigen::Vector2d pixel_match, pixel_projection, pixel_velocity;
+    // 声明点处理相关变量
+    Eigen::Vector3d point_world, point_camera;                     // 3D点的世界坐标和相机坐标
+    Eigen::Vector2d pixel_match, pixel_projection, pixel_velocity; // 2D像素：匹配点、投影点、速度
 
+    // === 初始化本次迭代的矩阵 ===
     H_mat.setZero();
     solution.setZero();
     residual_vec.setZero();
@@ -554,104 +653,143 @@ bool imageProcessing::vioPhotometric(cloudFrame* p_frame) {
     K.setZero();
     d_x.setZero();
 
-    Eigen::Vector3d d_p = p_frame->p_state->t_imu_camera - p_predict;
-    Eigen::Quaterniond d_q = q_predict.inverse() * Eigen::Quaterniond(p_frame->p_state->R_imu_camera);
-    Eigen::Vector3d d_so3 = numType::quatToSo3(d_q);
+    // === 计算当前外参相对于预测值的偏差 ===
+    Eigen::Vector3d d_p = p_frame->p_state->t_imu_camera - p_predict;                     // 平移偏差
+    Eigen::Quaterniond d_q = q_predict.inverse() * Eigen::Quaterniond(p_frame->p_state->R_imu_camera); // 旋转偏差
+    Eigen::Vector3d d_so3 = numType::quatToSo3(d_q);                                      // 旋转偏差的so(3)表示
 
-    d_x.head<3>() = d_so3;
-    d_x.tail<3>() = d_p;
+    // === 组装状态偏差向量 d_x（6维：仅外参） ===
+    d_x.head<3>() = d_so3;   // 旋转偏差（so3表示）
+    d_x.tail<3>() = d_p;     // 平移偏差
 
     num_used_point_count = 0;
 
+    // === 遍历所有跟踪点构建光度观测方程 ===
     for (auto it = op_tracker->map_rgb_points_in_last_image_pose.begin();
          it != op_tracker->map_rgb_points_in_last_image_pose.end();
          it++) {
+      
+      // === 质量检查：只使用被观测足够次数的点 ===
       if (((rgbPoint*)it->first)->N_rgb < 3)
-        continue;
+        continue;  // 跳过观测次数少于3次的点
 
       point_idx++;
 
-      point_world = ((rgbPoint*)it->first)->getPosition();
-      pixel_velocity = ((rgbPoint*)it->first)->image_velocity;
+      // === 获取点的信息 ===
+      point_world = ((rgbPoint*)it->first)->getPosition();    // 3D点世界坐标
+      pixel_velocity = ((rgbPoint*)it->first)->image_velocity; // 图像平面速度
 
-      point_camera =
-          p_frame->p_state->q_camera_world.toRotationMatrix() * point_world + p_frame->p_state->t_camera_world;
+      // === 计算3D点在相机坐标系下的位置 ===
+      point_camera = p_frame->p_state->q_camera_world.toRotationMatrix() * point_world + 
+                     p_frame->p_state->t_camera_world;
+
+      // === 计算投影到图像平面的像素位置（包含运动补偿） ===
       pixel_projection = Eigen::Vector2d(
                              p_frame->p_state->fx * point_camera(0) / point_camera(2) + p_frame->p_state->cx,
                              p_frame->p_state->fy * point_camera(1) / point_camera(2) + p_frame->p_state->cy) +
                          p_frame->p_state->time_td * pixel_velocity;
 
-      Eigen::Vector3d point_color = ((rgbPoint*)it->first)->getRgb();
-      Eigen::Matrix3d point_rgb_info = Eigen::Matrix3d::Zero();
-      Eigen::Matrix3d point_rgb_cov = ((rgbPoint*)it->first)->getCovRgb();
+      // === 获取点的颜色信息和不确定性 ===
+      Eigen::Vector3d point_color = ((rgbPoint*)it->first)->getRgb();        // 地图中存储的RGB颜色
+      Eigen::Matrix3d point_rgb_info = Eigen::Matrix3d::Zero();              // RGB信息矩阵（协方差的逆）
+      Eigen::Matrix3d point_rgb_cov = ((rgbPoint*)it->first)->getCovRgb();   // RGB协方差矩阵
 
+      // === 构建RGB信息矩阵（对角矩阵） ===
       for (int i = 0; i < 3; i++) {
-        point_rgb_info(i, i) = 1.0 / point_rgb_cov(i, i);
+        point_rgb_info(i, i) = 1.0 / point_rgb_cov(i, i);  // 信息 = 1/方差
         R_mat_inv(point_idx * 3 + i, point_idx * 3 + i) = point_rgb_info(i, i);
         sqrt_info(point_idx * 3 + i, point_idx * 3 + i) = sqrt(R_mat_inv(point_idx * 3 + i, point_idx * 3 + i));
       }
 
-      Eigen::Vector3d obs_color_dx, obs_color_dy;
-      Eigen::Vector3d obs_color =
-          p_frame->getRgb(pixel_projection(0), pixel_projection(1), 0, &obs_color_dx, &obs_color_dy);
-      Eigen::Vector3d residual = obs_color - point_color;
+      // === 从当前图像中采样RGB颜色及其梯度 ===
+      Eigen::Vector3d obs_color_dx, obs_color_dy;  // 颜色对像素坐标的梯度
+      Eigen::Vector3d obs_color = p_frame->getRgb(pixel_projection(0), pixel_projection(1), 0, 
+                                                   &obs_color_dx, &obs_color_dy);
 
-      double huber_loss = getHuberLoss(residual.norm());
+      // === 计算光度残差 ===
+      Eigen::Vector3d residual = obs_color - point_color;  // 观测颜色 - 地图颜色
+
+      // === 应用Huber损失函数增强鲁棒性 ===
+      double huber_loss = getHuberLoss(residual.norm());  // 基于残差范数计算Huber权重
       residual *= huber_loss;
 
+      // 将加权残差存入残差向量
       residual_vec.block<3, 1>(point_idx * 3, 0) = (obs_color - point_color) * huber_loss;
 
+      // 累积加权残差（用于收敛判断）
       acc_residual += residual.transpose() * point_rgb_info * residual;
 
+      // === 计算雅可比矩阵链式法则 ===
+      
+      // 颜色对像素坐标的雅可比：∂color/∂u
       Eigen::Matrix<double, 3, 2, Eigen::RowMajor> J_color_u;
-
-      J_color_u.block<3, 1>(0, 0) = obs_color_dx;
-      J_color_u.block<3, 1>(0, 1) = obs_color_dy;
+      J_color_u.block<3, 1>(0, 0) = obs_color_dx;  // ∂color/∂u
+      J_color_u.block<3, 1>(0, 1) = obs_color_dy;  // ∂color/∂v
 
       num_used_point_count++;
 
+      // 像素坐标对相机坐标的雅可比：∂u/∂p_c
       Eigen::Matrix<double, 2, 3, Eigen::RowMajor> J_u_pc;
-
       J_u_pc << p_frame->p_state->fx / point_camera.z(), 0,
-          -(p_frame->p_state->fx * point_camera.x()) / (point_camera.z() * point_camera.z()), 0,
-          p_frame->p_state->fy / point_camera.z(),
+          -(p_frame->p_state->fx * point_camera.x()) / (point_camera.z() * point_camera.z()), 
+          0, p_frame->p_state->fy / point_camera.z(),
           -(p_frame->p_state->fy * point_camera.y()) / (point_camera.z() * point_camera.z());
 
+      // 链式法则：∂color/∂p_c = ∂color/∂u * ∂u/∂p_c
       Eigen::Matrix3d J_color_pc = J_color_u * J_u_pc;
 
+      // === 填充雅可比矩阵 H_mat（仅外参） ===
       if (ifEstimateExtrinsic) {
+        // 对旋转的雅可比：∂color/∂δθ = ∂color/∂p_c * ∂p_c/∂δθ
         H_mat.block<3, 3>(point_idx * 3, 0) = J_color_pc * numType::skewSymmetric(point_camera) * huber_loss;
+        // 对平移的雅可比：∂color/∂t = -∂color/∂p_c * R^T
         H_mat.block<3, 3>(point_idx * 3, 3) = -J_color_pc * p_frame->p_state->R_imu_camera.transpose() * huber_loss;
       }
     }
 
+    // === 检查可用点数 ===
     if (num_used_point_count < minimum_iteration_points) {
-      break;
+      break;  // 可用点数太少，退出迭代
     }
 
+    // === 扩展卡尔曼滤波更新（仅外参） ===
+    
+    // 构建雅可比矩阵J（考虑SO(3)流形结构）
     Eigen::Matrix<double, 6, 6> J_zero = Eigen::MatrixXd::Identity(6, 6);
-
+    
+    // 计算SO(3)的左雅可比近似
     common::Timer::Evaluate(
         log_time,
         ros::Time::now().toSec(),
         [&]() { J_zero.block<3, 3>(0, 0) = Eigen::Matrix3d::Identity() - 0.5 * numType::skewSymmetric(d_x.head<3>()); },
         "eq_skew");
 
+    // === 高效矩阵计算 ===
     Eigen::Matrix<double, 6, 6> eq_Inv, eq_H_mat1;
 
+    // 使用CUDA加速的矩阵乘法：H^T * R^{-1}
     eq_H_mat1 = cublasMul.multiply(H_mat.transpose(), R_mat_inv);
 
+    // 计算先验项的逆：(J*P*J^T * weight)^{-1}
     eq_Inv = (J_zero * covariance.block<6, 6>(1, 1) * J_zero.transpose() * cam_measurement_weight).inverse();
 
+    // 计算卡尔曼增益：K = (H^T*R^{-1}*H + Prior^{-1})^{-1} * H^T*R^{-1}
     K = (eq_H_mat1 * H_mat + eq_Inv).inverse() * eq_H_mat1;
-
+    
+    // 计算状态更新：δx = -K*r - (I-K*H)*J*d_x
     solution = -K * residual_vec - (Eigen::Matrix<double, 6, 6>::Identity() - K * H_mat) * J_zero * d_x;
+    
+    // === 更新相机外参 ===
     updateCameraParameters(p_frame, solution);
 
+    // === 收敛性检查 ===
+    
+    // 如果平均残差足够小，认为收敛
     if ((acc_residual / total_point_size) < 10) {
       break;
     }
 
+    // 如果残差变化足够小，认为收敛
     if (fabs(acc_residual - last_acc_residual) < 0.01) {
       break;
     }
@@ -659,27 +797,39 @@ bool imageProcessing::vioPhotometric(cloudFrame* p_frame) {
     last_acc_residual = acc_residual;
   }
 
+  // === 更新协方差矩阵（仅外参部分） ===
+  // 使用Joseph形式保证数值稳定性
   Eigen::Matrix<double, 6, 6> J_k = Eigen::MatrixXd::Identity(6, 6);
-
   J_k.block<3, 3>(0, 0) = Eigen::Matrix3d::Identity() - 0.5 * numType::skewSymmetric(solution.head<3>());
 
+  // 更新协方差矩阵的外参部分：P_{ext} = J*(I-K*H)*P_{ext}*J^T
   covariance.block<6, 6>(1, 1) =
       J_k * (Eigen::Matrix<double, 6, 6>::Identity() - K * H_mat) * covariance.block<6, 6>(1, 1) * J_k.transpose();
 
   return true;
 }
 
+/**
+ * 更新相机参数函数（6维版本）
+ * 仅更新外参，用于光度优化
+ * @param p_frame 当前点云帧指针
+ * @param d_x 状态增量向量（6维）：[so3(3), t_ic(3)]
+ */
 void imageProcessing::updateCameraParameters(cloudFrame* p_frame, Eigen::Matrix<double, 6, 1>& d_x) {
+  // === 更新IMU到相机的旋转外参 ===
   Eigen::Quaterniond q_imu_camera = Eigen::Quaterniond(p_frame->p_state->R_imu_camera);
-  q_imu_camera = (q_imu_camera * numType::so3ToQuat(d_x.segment<3>(0))).normalized();
-
+  q_imu_camera = (q_imu_camera * numType::so3ToQuat(d_x.head<3>())).normalized();
   p_frame->p_state->R_imu_camera = q_imu_camera.toRotationMatrix();
-  p_frame->p_state->t_imu_camera += d_x.segment<3>(3);
+  
+  // === 更新IMU到相机的平移外参 ===
+  p_frame->p_state->t_imu_camera += d_x.tail<3>();
 
+  // === 计算世界到相机的复合变换 ===
   p_frame->p_state->q_world_camera =
       Eigen::Quaterniond(p_frame->p_state->rotation.toRotationMatrix() * p_frame->p_state->R_imu_camera);
   p_frame->p_state->t_world_camera =
       p_frame->p_state->rotation.toRotationMatrix() * p_frame->p_state->t_imu_camera + p_frame->p_state->translation;
 
+  // === 刷新投影相关的缓存变量 ===
   p_frame->refreshPoseForProjection();
 }

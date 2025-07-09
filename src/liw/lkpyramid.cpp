@@ -755,59 +755,100 @@ void LKOpticalFlowKernel::swapImageBuffer() {
   }
 }
 
+/**
+ * LK光流跟踪主函数
+ * 使用Lucas-Kanade算法在图像金字塔上跟踪特征点
+ * @param curr_img 当前输入图像
+ * @param last_tracked_pts 上一帧的跟踪点坐标
+ * @param curr_tracked_pts 当前帧跟踪到的点坐标（输出）
+ * @param status 每个点的跟踪状态向量（输出）
+ * @param opm_method 优化方法参数
+ * @return 成功跟踪的点数
+ */
 int LKOpticalFlowKernel::trackImage(
-    const cv::Mat& curr_img,
-    const std::vector<cv::Point2f>& last_tracked_pts,
-    std::vector<cv::Point2f>& curr_tracked_pts,
-    std::vector<uchar>& status,
-    int opm_method) {
-  maxLevel = opencvBuildOpticalFlowPyramid(curr_img, curr_img_pyr, lk_win_size, maxLevel, false);
+  const cv::Mat& curr_img,
+  const std::vector<cv::Point2f>& last_tracked_pts,
+  std::vector<cv::Point2f>& curr_tracked_pts,
+  std::vector<uchar>& status,
+  int opm_method) {
 
-  calcImageDerivSharr(curr_img_pyr, curr_img_deriv_I, curr_img_deriv_I_buff);
+// === 构建当前图像的金字塔 ===
+// 创建多尺度图像金字塔，用于粗到细的光流计算
+// 金字塔可以提高跟踪的鲁棒性和计算效率
+maxLevel = opencvBuildOpticalFlowPyramid(
+    curr_img,           // 输入图像
+    curr_img_pyr,       // 输出的图像金字塔
+    lk_win_size,        // LK算法的窗口大小
+    maxLevel,           // 最大金字塔层数
+    false);             // 是否使用带权重的金字塔
 
-  if (prev_img_pyr.size() == 0 || (prev_img_pyr[0].cols == 0))  // The first img
-  {
-    prev_img_pyr.resize(curr_img_pyr.size());
+// === 计算当前图像的梯度 ===
+// 使用Sharr算子计算每层金字塔的图像梯度
+// 梯度信息用于LK算法中的光流方程求解
+calcImageDerivSharr(curr_img_pyr, curr_img_deriv_I, curr_img_deriv_I_buff);
 
-    allocateImgDerivMemory(curr_img_pyr, prev_img_deriv_I, prev_img_deriv_I_buff);
+// === 处理第一帧的特殊情况 ===
+if (prev_img_pyr.size() == 0 || (prev_img_pyr[0].cols == 0))  // 第一帧图像
+{
+  // 为前一帧图像金字塔分配内存空间
+  prev_img_pyr.resize(curr_img_pyr.size());
 
-    swapImageBuffer();
+  // 为前一帧图像梯度分配内存空间
+  allocateImgDerivMemory(curr_img_pyr, prev_img_deriv_I, prev_img_deriv_I_buff);
 
-    curr_tracked_pts = last_tracked_pts;
-
-    return 0;
-  }
-
-  curr_tracked_pts = last_tracked_pts;
-  status.resize(last_tracked_pts.size());
-
-  for (int i = 0; i < last_tracked_pts.size(); i++) {
-    status[i] = 1;
-  }
-
-  cv::parallel_for_(Range(0, last_tracked_pts.size()), [&](const Range& range) {
-    for (int level = maxLevel; level >= 0; level--) {
-      calculateLKOpticalFlow(
-          range,
-          &prev_img_pyr[level],
-          &prev_img_deriv_I[level],
-          &curr_img_pyr[level],
-          last_tracked_pts.data(),
-          curr_tracked_pts.data(),
-          status.data(),
-          0,
-          lk_win_size,
-          terminate_criteria,
-          level,
-          maxLevel,
-          flags,
-          minEigThreshold);
-    }
-  });
-
+  // 交换图像缓冲区，将当前帧设为前一帧
   swapImageBuffer();
 
-  return std::accumulate(status.begin(), status.end(), 0);
+  // 第一帧时，当前跟踪点直接等于输入点（无法计算光流）
+  curr_tracked_pts = last_tracked_pts;
+
+  // 第一帧返回0，表示没有实际的跟踪计算
+  return 0;
+}
+
+// === 初始化跟踪数据 ===
+// 将上一帧的跟踪点作为当前帧跟踪的初始猜测
+curr_tracked_pts = last_tracked_pts;
+
+// 调整状态向量大小，与跟踪点数量一致
+status.resize(last_tracked_pts.size());
+
+// 初始化所有点的状态为成功（1表示成功，0表示失败）
+for (int i = 0; i < last_tracked_pts.size(); i++) {
+  status[i] = 1;
+}
+
+// === 并行执行多层金字塔光流跟踪 ===
+// 使用OpenCV的并行计算框架，对所有跟踪点并行处理
+cv::parallel_for_(Range(0, last_tracked_pts.size()), [&](const Range& range) {
+  // 从最高层（最粗糙）到最低层（最精细）依次计算光流
+  for (int level = maxLevel; level >= 0; level--) {
+    // 计算当前层的LK光流
+    calculateLKOpticalFlow(
+        range,                              // 并行计算的点范围
+        &prev_img_pyr[level],              // 前一帧当前层图像
+        &prev_img_deriv_I[level],          // 前一帧当前层梯度
+        &curr_img_pyr[level],              // 当前帧当前层图像
+        last_tracked_pts.data(),           // 输入的跟踪点
+        curr_tracked_pts.data(),           // 输出的跟踪点
+        status.data(),                     // 跟踪状态
+        0,                                 // 特征点起始索引
+        lk_win_size,                       // LK算法窗口大小
+        terminate_criteria,                // 迭代终止条件
+        level,                             // 当前金字塔层级
+        maxLevel,                          // 最大金字塔层级
+        flags,                             // 算法标志
+        minEigThreshold);                  // 最小特征值阈值
+  }
+});
+
+// === 更新图像缓冲区 ===
+// 将当前帧的数据交换到前一帧，为下次跟踪做准备
+swapImageBuffer();
+
+// === 返回成功跟踪的点数 ===
+// 统计状态向量中值为1的元素数量，即成功跟踪的特征点数
+return std::accumulate(status.begin(), status.end(), 0);
 }
 
 void calculateOpticalFlow(
