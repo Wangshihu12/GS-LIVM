@@ -35,48 +35,95 @@ void eskfEstimator::setBiasGyrCov(double para) {
   b_gyr_cov << para, para, para;
 }
 
+/**
+ * 尝试初始化ESKF估计器
+ * 使用静止状态下的IMU测量数据估计初始偏置和重力向量
+ * @param imu_meas IMU测量数据向量：每个元素包含时间戳、加速度计和陀螺仪测量值
+ */
 void eskfEstimator::tryInit(
-    const std::vector<std::pair<double, std::pair<Eigen::Vector3d, Eigen::Vector3d>>>& imu_meas) {
-  initialization(imu_meas);
+  const std::vector<std::pair<double, std::pair<Eigen::Vector3d, Eigen::Vector3d>>>& imu_meas) {
 
-  if (num_init_meas > MIN_INI_COUNT && imu_meas.back().first - time_first_imu > MIN_INI_TIME) {
-    acc_cov *= std::pow(G_norm / mean_acc.norm(), 2);
+// === 执行IMU数据初始化处理 ===
+// 计算IMU测量数据的统计信息（均值、协方差等）
+initialization(imu_meas);
 
-    if (gyr_cov.norm() > MAX_GYR_VAR) {
-      LOG(ERROR) << "Too large noise of gyroscope measurements. " << gyr_cov.norm() << " > " << MAX_GYR_VAR;
-      return;
-    }
+// === 检查初始化条件 ===
+// 条件1：测量数量足够（超过最小初始化计数）
+// 条件2：时间窗口足够长（超过最小初始化时间）
+if (num_init_meas > MIN_INI_COUNT && imu_meas.back().first - time_first_imu > MIN_INI_TIME) {
+  
+  // === 调整加速度计协方差 ===
+  // 根据重力加速度的理论值和实际测量值的比值来调整协方差
+  // 这样可以补偿由于加速度计标定不准确导致的误差
+  acc_cov *= std::pow(G_norm / mean_acc.norm(), 2);
 
-    if (acc_cov.norm() > MAX_ACC_VAR) {
-      LOG(ERROR) << "Too large noise of accelerometer measurements. " << acc_cov.norm() << " > " << MAX_ACC_VAR;
-      return;
-    }
+  // === 检查陀螺仪噪声水平 ===
+  // 如果陀螺仪噪声过大，说明IMU质量较差或环境不稳定
+  if (gyr_cov.norm() > MAX_GYR_VAR) {
+    LOG(ERROR) << "Too large noise of gyroscope measurements. " << gyr_cov.norm() << " > " << MAX_GYR_VAR;
+    return;  // 初始化失败，返回
+  }
 
-    initial_flag = true;
+  // === 检查加速度计噪声水平 ===
+  // 如果加速度计噪声过大，说明IMU质量较差或环境不稳定
+  if (acc_cov.norm() > MAX_ACC_VAR) {
+    LOG(ERROR) << "Too large noise of accelerometer measurements. " << acc_cov.norm() << " > " << MAX_ACC_VAR;
+    return;  // 初始化失败，返回
+  }
 
-    gyr_cov = gyr_cov_scale;
-    acc_cov = acc_cov_scale;
+  // === 设置初始化完成标志 ===
+  initial_flag = true;
 
-    Eigen::Vector3d init_bg = mean_gyr;
-    Eigen::Vector3d init_gravity = mean_acc / mean_acc.norm() * G_norm;
+  // === 重置噪声协方差为预设值 ===
+  // 使用预设的噪声模型替代初始化阶段计算的统计值
+  // 这样可以避免初始化阶段的特殊条件影响后续的滤波性能
+  gyr_cov = gyr_cov_scale;    // 陀螺仪噪声协方差
+  acc_cov = acc_cov_scale;    // 加速度计噪声协方差
 
-    setBg(init_bg);
-    setGravity(init_gravity);
+  // === 计算初始偏置和重力向量 ===
+  // 陀螺仪偏置：静止状态下陀螺仪的平均读数即为偏置
+  Eigen::Vector3d init_bg = mean_gyr;
+  
+  // 重力向量：将加速度计平均值归一化后乘以标准重力加速度
+  // 静止状态下加速度计主要感受重力加速度
+  Eigen::Vector3d init_gravity = mean_acc / mean_acc.norm() * G_norm;
 
-    covariance.block<3, 3>(9, 9) *= 0.001;
-    covariance.block<3, 3>(12, 12) *= 0.0001;
-    covariance.block<2, 2>(15, 15) *= 0.00001;
+  // === 设置估计器的初始状态 ===
+  setBg(init_bg);              // 设置陀螺仪偏置
+  setGravity(init_gravity);    // 设置重力向量
 
-    initializeNoise();
+  // === 调整状态协方差矩阵 ===
+  // 对特定状态变量的协方差进行缩放，反映初始化后的置信度
+  
+  // 陀螺仪偏置的协方差（状态向量的第9-11维）
+  // 乘以0.001表示对初始化得到的陀螺仪偏置有较高的置信度
+  covariance.block<3, 3>(9, 9) *= 0.001;
+  
+  // 加速度计偏置的协方差（状态向量的第12-14维）
+  // 乘以0.0001表示对加速度计偏置的初始估计有很高的置信度
+  covariance.block<3, 3>(12, 12) *= 0.0001;
+  
+  // 重力向量的协方差（状态向量的第15-16维，因为重力向量在流形上只有2个自由度）
+  // 乘以0.00001表示对重力向量的初始估计有极高的置信度
+  covariance.block<2, 2>(15, 15) *= 0.00001;
 
-    ROS_INFO("IMU Initialization Done.");
+  // === 初始化噪声参数 ===
+  // 设置滤波器的过程噪声和观测噪声参数
+  initializeNoise();
 
-    std::cout << "init_gravity = " << init_gravity.transpose() << std::endl;
-    std::cout << "init_bg = " << init_bg.transpose() << std::endl;
-  } else
-    ROS_INFO("Wait more IMU measurements...");
+  // === 输出初始化结果 ===
+  ROS_INFO("IMU Initialization Done.");
+  
+  // 打印初始化得到的重要参数
+  std::cout << "init_gravity = " << init_gravity.transpose() << std::endl;
+  std::cout << "init_bg = " << init_bg.transpose() << std::endl;
+} 
+else {
+  // === 初始化条件不满足 ===
+  ROS_INFO("Wait more IMU measurements...");
+}
 
-  return;
+return;
 }
 
 void eskfEstimator::initialization(

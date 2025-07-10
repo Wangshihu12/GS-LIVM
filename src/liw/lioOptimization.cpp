@@ -552,48 +552,85 @@ void lioOptimization::initialValue() {
   // std::cout << "t_camera_lidar: \n" << std::fixed << t_camera_lidar.transpose() << std::endl;
 }
 
+/**
+ * 将RGB点添加到体素哈希地图中
+ * 使用体素化方式管理3D点云，避免点云过密并保持空间分布的均匀性
+ * @param map 体素哈希地图引用
+ * @param point 要添加的RGB点
+ * @param voxel_size 体素大小（米）
+ * @param max_num_points_in_voxel 每个体素允许的最大点数
+ * @param min_distance_points 点之间的最小距离阈值（米）
+ * @param min_num_points 体素中要求的最小点数（用于初始化控制）
+ * @param p_frame 当前点云帧指针
+ */
 void lioOptimization::addPointToMap(
-    voxelHashMap& map,
-    rgbPoint& point,
-    double voxel_size,
-    int max_num_points_in_voxel,
-    double min_distance_points,
-    int min_num_points,
-    cloudFrame* p_frame) {
-  short kx = static_cast<short>(point.getPosition().x() / voxel_size);
-  short ky = static_cast<short>(point.getPosition().y() / voxel_size);
-  short kz = static_cast<short>(point.getPosition().z() / voxel_size);
+  voxelHashMap& map,
+  rgbPoint& point,
+  double voxel_size,
+  int max_num_points_in_voxel,
+  double min_distance_points,
+  int min_num_points,
+  cloudFrame* p_frame) {
 
-  voxelHashMap::iterator search = map.find(voxel(kx, ky, kz));
+// === 计算点所属的体素坐标 ===
+// 将3D坐标转换为离散的体素索引，用于哈希表查找
+short kx = static_cast<short>(point.getPosition().x() / voxel_size);
+short ky = static_cast<short>(point.getPosition().y() / voxel_size);
+short kz = static_cast<short>(point.getPosition().z() / voxel_size);
 
-  if (search != map.end()) {
-    auto& voxel_block = (search.value());
+// === 在哈希地图中查找对应的体素 ===
+// 使用3D体素坐标作为键值进行查找
+voxelHashMap::iterator search = map.find(voxel(kx, ky, kz));
 
-    if (!voxel_block.IsFull()) {
-      double sq_dist_min_to_points = 10 * voxel_size * voxel_size;
+// === 情况1：体素已存在 ===
+if (search != map.end()) {
+  // 获取体素块的引用
+  auto& voxel_block = (search.value());
 
-      for (int i(0); i < voxel_block.NumPoints(); ++i) {
-        auto& _point = voxel_block.points[i];
-        double sq_dist = (_point.getPosition() - point.getPosition()).squaredNorm();
-        if (sq_dist < sq_dist_min_to_points) {
-          sq_dist_min_to_points = sq_dist;
-        }
-      }
+  // === 检查体素是否未满 ===
+  // 只有未满的体素才能添加新点
+  if (!voxel_block.IsFull()) {
+    // 初始化最小距离为一个较大值（10倍体素大小的平方）
+    double sq_dist_min_to_points = 10 * voxel_size * voxel_size;
 
-      if (sq_dist_min_to_points > (min_distance_points * min_distance_points)) {
-        if (min_num_points <= 0 || voxel_block.NumPoints() >= min_num_points) {
-          voxel_block.AddPoint(point);
-          addPointToPcl(points_world, point, p_frame);
-        }
+    // === 计算与体素内现有点的最小距离 ===
+    // 遍历体素内的所有现有点，找到距离新点最近的点
+    for (int i(0); i < voxel_block.NumPoints(); ++i) {
+      auto& _point = voxel_block.points[i];
+      // 计算欧氏距离的平方（避免开方运算，提高效率）
+      double sq_dist = (_point.getPosition() - point.getPosition()).squaredNorm();
+      if (sq_dist < sq_dist_min_to_points) {
+        sq_dist_min_to_points = sq_dist;
       }
     }
-  } else {
-    if (min_num_points <= 0) {
-      voxelBlock voxel_block(max_num_points_in_voxel);
-      voxel_block.AddPoint(point);
-      map[voxel(kx, ky, kz)] = std::move(voxel_block);
+
+    // === 距离检查和点数检查 ===
+    // 条件1：新点与现有点的最小距离大于阈值（避免点云过密）
+    // 条件2：体素内点数满足最小要求或无最小点数限制
+    if (sq_dist_min_to_points > (min_distance_points * min_distance_points)) {
+      if (min_num_points <= 0 || voxel_block.NumPoints() >= min_num_points) {
+        // === 添加点到体素和全局点云 ===
+        voxel_block.AddPoint(point);                    // 添加到体素块
+        addPointToPcl(points_world, point, p_frame);    // 添加到全局PCL点云
+      }
     }
   }
+} 
+// === 情况2：体素不存在，需要创建新体素 ===
+else {
+  // === 检查最小点数要求 ===
+  // 只有在没有最小点数限制时才创建新体素
+  // 这可以避免在初始化阶段创建过多稀疏的体素
+  if (min_num_points <= 0) {
+    // === 创建新的体素块 ===
+    voxelBlock voxel_block(max_num_points_in_voxel);  // 设置最大容量
+    voxel_block.AddPoint(point);                      // 添加第一个点
+    
+    // === 将新体素添加到哈希地图 ===
+    // 使用move语义避免不必要的拷贝
+    map[voxel(kx, ky, kz)] = std::move(voxel_block);
+  }
+}
 }
 
 /**
@@ -936,107 +973,150 @@ void lioOptimization::compressedImageHandler(const sensor_msgs::CompressedImageC
   last_time_img = msg->header.stamp.toSec();
 }
 
+/**
+ * 获取同步测量数据函数
+ * 从IMU、图像和激光雷达缓冲区中提取时间同步的测量数据包
+ * 实现多传感器数据的时间对齐和打包，为后续的融合处理做准备
+ * @return 同步的测量数据向量
+ */
 std::vector<Measurements> lioOptimization::getMeasurements() {
-  std::vector<Measurements> measurements;
+  std::vector<Measurements> measurements;  // 输出的测量数据包向量
 
   while (true) {
+    // === 检查缓冲区状态 ===
+    // 如果任何一个缓冲区为空，无法进行数据同步，直接返回
     if (imu_buffer.empty() || time_img_buffer.empty() || point_buffer.empty()) {
       return measurements;
     }
 
+    // === 检查时间顺序 ===
+    // 如果最新的点云数据时间戳早于或等于最早的图像时间戳
+    // 说明当前没有足够的数据进行同步，返回空结果
     if (point_buffer.back().timestamp <= time_img_buffer.front().timestamp) {
       return measurements;
     }
 
+    // === 检查数据时间一致性 ===
+    // 如果点云和图像的时间戳差异过大（>1000秒），认为是数据异常
     if (abs(point_buffer.front().timestamp - time_img_buffer.front().timestamp) > 1e3) {
       std::cout << "data time fault " << point_buffer.empty() << std::endl;
       std::cout << "points: " << point_buffer.front().timestamp << ", " << time_img_buffer.front().timestamp << " "
                 << (point_buffer.front().timestamp < time_img_buffer.front().timestamp) << std::endl;
 
       std::cout << point_buffer.size() << " " << time_img_buffer.size() << " " << time_img_buffer.size() << std::endl;
+      // 丢弃异常的点云数据
       point_buffer.pop();
     }
 
+    // === 时间同步检查1：点云时间太新 ===
+    // 如果点云时间戳大于等于图像时间戳，说明当前图像过旧，丢弃它
     if (point_buffer.front().timestamp >= time_img_buffer.front().timestamp) {
-      time_img_buffer.front().image.release();
+      time_img_buffer.front().image.release();  // 释放图像内存
       time_img_buffer.pop();
       continue;
     }
 
-    // std::cout << "imu: " << imu_buffer.front()->header.stamp.toSec() << ", " << time_img_buffer.front().timestamp << std::endl;
-
+    // === 时间同步检查2：IMU数据不足 ===
+    // 如果最新的IMU数据时间戳早于或等于图像时间戳，说明IMU数据不足，无法进行融合
     if (imu_buffer.back()->header.stamp.toSec() <= time_img_buffer.front().timestamp) {
       return measurements;
     }
 
+    // === 时间同步检查3：IMU时间太新 ===
+    // 如果最早的IMU数据时间戳大于等于图像时间戳，说明当前图像过旧，丢弃它
     if (imu_buffer.front()->header.stamp.toSec() >= time_img_buffer.front().timestamp) {
-      time_img_buffer.front().image.release();
+      time_img_buffer.front().image.release();  // 释放图像内存
       time_img_buffer.pop();
       continue;
     }
 
+    // === 创建测量数据包 ===
     Measurements measurement;
 
+    // === 情况1：基于扫描间隔的数据包（无图像渲染） ===
+    // 如果当前时间距离上次获取测量的时间超过了一个扫描间隔，
+    // 则创建一个基于扫描间隔的数据包，不包含图像数据
     if (last_get_measurement + cloud_pro->getSweepInterval() <
         time_img_buffer.front().timestamp - 1 * cloud_pro->getSweepInterval()) {
+      
+      // 设置测量时间为上次时间加上扫描间隔
       measurement.time_image = last_get_measurement + cloud_pro->getSweepInterval();
 
+      // === 收集IMU数据 ===
+      // 收集时间戳小于目标时间的所有IMU数据
       while (imu_buffer.front()->header.stamp.toSec() < last_get_measurement + cloud_pro->getSweepInterval()) {
         measurement.imu_measurements.emplace_back(imu_buffer.front());
         imu_buffer.pop();
       }
-
+      // 再添加一个刚好大于或等于目标时间的IMU数据
       measurement.imu_measurements.emplace_back(imu_buffer.front());
 
+      // === 收集激光雷达数据 ===
+      // 收集时间戳小于目标时间的所有点云数据
       while (point_buffer.front().timestamp < last_get_measurement + cloud_pro->getSweepInterval()) {
         measurement.lidar_points.push_back(point_buffer.front());
         point_buffer.pop();
       }
 
-      measurement.time_sweep.first = last_get_measurement;
-      measurement.time_sweep.second = cloud_pro->getSweepInterval();
+      // === 设置时间窗口 ===
+      measurement.time_sweep.first = last_get_measurement;           // 起始时间
+      measurement.time_sweep.second = cloud_pro->getSweepInterval(); // 时间间隔
 
-      measurement.rendering = false;
+      // === 设置渲染标志 ===
+      measurement.rendering = false;  // 此类数据包不进行渲染
 
+      // === 添加到结果中 ===
       if (measurement.lidar_points.size() > 0) {
         measurements.emplace_back(measurement);
         last_rendering = measurement.rendering;
       }
 
+      // 更新上次获取测量的时间
       last_get_measurement = last_get_measurement + cloud_pro->getSweepInterval();
-
       break;
-    } else {
+    } 
+    // === 情况2：基于图像时间戳的数据包（包含图像渲染） ===
+    else {
+      // 设置测量时间为图像时间戳
       measurement.time_image = time_img_buffer.front().timestamp;
+      // 复制图像数据
       measurement.image = time_img_buffer.front().image.clone();
 
+      // 释放缓冲区中的图像内存并移除
       time_img_buffer.front().image.release();
       time_img_buffer.pop();
 
+      // === 收集IMU数据 ===
+      // 收集时间戳小于图像时间戳的所有IMU数据
       while (imu_buffer.front()->header.stamp.toSec() < measurement.time_image) {
         measurement.imu_measurements.emplace_back(imu_buffer.front());
         imu_buffer.pop();
       }
-
+      // 再添加一个刚好大于或等于图像时间戳的IMU数据
       measurement.imu_measurements.emplace_back(imu_buffer.front());
 
+      // === 收集激光雷达数据 ===
+      // 收集时间戳小于图像时间戳的所有点云数据
       while (point_buffer.front().timestamp < measurement.time_image) {
         measurement.lidar_points.push_back(point_buffer.front());
         point_buffer.pop();
       }
 
-      measurement.time_sweep.first = last_get_measurement;
-      measurement.time_sweep.second = measurement.time_image - last_get_measurement;
+      // === 设置时间窗口 ===
+      measurement.time_sweep.first = last_get_measurement;                           // 起始时间
+      measurement.time_sweep.second = measurement.time_image - last_get_measurement; // 时间间隔
 
-      measurement.rendering = true;
+      // === 设置渲染标志 ===
+      measurement.rendering = true;   // 此类数据包需要进行渲染
 
+      // === 添加到结果中 ===
       if (measurement.lidar_points.size() > 0) {
         measurements.emplace_back(measurement);
         last_rendering = measurement.rendering;
       }
 
+      // 更新上次获取测量的时间
       last_get_measurement = measurement.time_image;
-
       break;
     }
   }
@@ -2281,56 +2361,91 @@ void lioOptimization::pubColorPoints(ros::Publisher& pub_cloud_rgb, cloudFrame* 
   pub_cloud_rgb.publish(ros_points_msg);
 }
 
+/**
+ * 线程函数：添加颜色点到全局点云
+ * 持续监控RGB地图跟踪器中的新增点，将其转换为PCL格式并添加到全局颜色点云中
+ * 这个函数在单独的线程中运行，负责数据的异步处理和发布
+ */
 void lioOptimization::threadAddColorPoints() {
-  int last_pub_map_index = -1000;
-  int sleep_time_after_pub = 10;
+  // === 初始化控制变量 ===
+  int last_pub_map_index = -1000;    // 上次发布地图的帧索引，初始化为很小的值
+  int sleep_time_after_pub = 10;     // 发布后的休眠时间（未使用）
 
+  // === 主循环：持续处理新增的颜色点 ===
   while (1) {
+    // 检查线程停止标志
     if (stop_thread) {
       std::cout << "Stop threadAddColorPoints thread.\n" << std::endl;
       break;
     }
 
+    // === 获取当前RGB点的数量 ===
     int points_size;
     {
+      // 加锁访问RGB点向量，获取当前点的总数
       std::lock_guard<std::mutex> lock(*img_pro->map_tracker->mutex_rgb_points_vec);
       points_size = img_pro->map_tracker->rgb_points_vec.size();
     }
 
+    // === 创建PCL点云容器 ===
+    // 用于存储转换后的RGB点云数据
     pcl::PointCloud<pcl::PointXYZRGB>::Ptr points_rgb_vec(new pcl::PointCloud<pcl::PointXYZRGB>());
+    
+    // === 获取更新帧索引 ===
     int updated_frame_index;
     {
+      // 加锁获取地图跟踪器的当前帧索引
       std::lock_guard<std::mutex> lock(*img_pro->map_tracker->mutex_frame_index);
       updated_frame_index = img_pro->map_tracker->updated_frame_index;
     }
 
+    // === 检查是否需要更新 ===
+    // 如果帧索引没有变化，说明没有新的数据需要处理
     if (last_pub_map_index == updated_frame_index) {
-      continue;
+      continue;  // 跳过本次循环，继续等待新数据
     }
 
+    // 更新已处理的帧索引
     last_pub_map_index = updated_frame_index;
 
+    // === 处理新增的RGB点 ===
+    // 从上次处理的索引开始，处理所有新增的点
     for (int i = 0; i < points_size - new_add_point_index; i++) {
-      pcl::PointXYZRGB tmp_point;
+      pcl::PointXYZRGB tmp_point;  // 临时PCL点
       {
+        // 加锁访问RGB点向量，进行数据转换
         std::lock_guard<std::mutex> lock(*img_pro->map_tracker->mutex_rgb_points_vec);
+        
+        // 提取3D位置坐标
         tmp_point.x = img_pro->map_tracker->rgb_points_vec[new_add_point_index + i]->getPosition()[0];
         tmp_point.y = img_pro->map_tracker->rgb_points_vec[new_add_point_index + i]->getPosition()[1];
         tmp_point.z = img_pro->map_tracker->rgb_points_vec[new_add_point_index + i]->getPosition()[2];
-        tmp_point.r = img_pro->map_tracker->rgb_points_vec[new_add_point_index + i]->getRgb()[2];
-        tmp_point.g = img_pro->map_tracker->rgb_points_vec[new_add_point_index + i]->getRgb()[1];
-        tmp_point.b = img_pro->map_tracker->rgb_points_vec[new_add_point_index + i]->getRgb()[0];
+        
+        // 提取RGB颜色信息（注意：原始数据可能是BGR格式，这里转换为RGB）
+        tmp_point.r = img_pro->map_tracker->rgb_points_vec[new_add_point_index + i]->getRgb()[2];  // R分量
+        tmp_point.g = img_pro->map_tracker->rgb_points_vec[new_add_point_index + i]->getRgb()[1];  // G分量
+        tmp_point.b = img_pro->map_tracker->rgb_points_vec[new_add_point_index + i]->getRgb()[0];  // B分量
+        
+        // 将转换后的点添加到PCL点云中
         points_rgb_vec->push_back(tmp_point);
       }
     }
+
+    // === 将新点云添加到全局颜色点云 ===
     {
+      // 加锁访问全局颜色点云，确保线程安全
       std::lock_guard<std::mutex> lock(color_points_mutex);
       if (points_rgb_vec->size() > 0) {
+        // 如果有新的点，将其合并到全局颜色点云中
         *color_points_world += *points_rgb_vec;
       }
     }
 
+    // === 更新处理索引 ===
+    // 记录已处理到的点的索引，下次只处理新增的点
     new_add_point_index = points_size;
+    
+    // 短暂休眠，避免过度占用CPU资源
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
   }
 }
